@@ -1,4 +1,0 @@
-seq_len,final_acc,best_acc,status
-64,0.98,1.0,success
-128,0.9696875,1.0,success
-256,0.188125,0.2562499940395355,success

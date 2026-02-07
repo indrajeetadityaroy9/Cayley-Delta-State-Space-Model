@@ -1,16 +1,21 @@
-"""Unified KSSM Block (Mamba-style architecture).
+"""KSSM Block: Kinetic State Space Model with Cayley discretization.
 
-This module implements a unified gated SSM block that matches Mamba's architecture:
-- Single in-projection (1 GEMM)
-- Conv1d for local smoothing
-- KSSM scan (fused Cayley + evolution)
-- Gating (replaces separate MLP)
-- Single out-projection (1 GEMM)
+Core Evolution Equation:
+    H_t = A_bar @ H_{t-1} + (K * V) * dt
+    y_t = Q^T @ H_t
 
-Key optimizations vs naive KSSM:
-- Grouped B projection (like Mamba's d_state): reduces in_proj from 4.7M to 2.4M params
-- Element-wise C output (like Mamba): eliminates 4.7M C_proj params
-- Fused Cayley+Scan kernel: eliminates A_bar intermediate tensor
+Cayley Transform (A-stable discretization):
+    A_bar = (I - tau*A)^{-1}(I + tau*A), where tau = dt/2
+
+    For A = [[-alpha, omega], [-omega, -alpha]] with alpha >= 0,
+    the Cayley transform guarantees |eigenvalue(A_bar)| <= 1.
+
+Key Components:
+    - AdaptiveTimestep: dt = c/(alpha + |omega|) for scale-invariance
+    - SelfNormalizingGates: Layer-aware protect/input gates
+    - Conv1dSiLU: Fused CUDA kernel (kernel_size=4)
+
+See: kssm/csrc/include/cayley_math.cuh for implementation details.
 """
 
 import math
@@ -21,376 +26,245 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from kssm.config import KSSMConfig
-from kssm.ops.scan_op import evolution_fused
+from kssm.modules.ssd import SSDChunkwiseScan
+from kssm.modules.components import (
+    AdaptiveTimestep,
+    SelfNormalizingGates,
+    Conv1dSiLU,
+    compute_variance_preserving_std,
+    compute_variance_preserving_scale,
+    apply_spectral_init,
+    RMSNorm,
+)
 
 
 class KSSMBlock(nn.Module):
-    """Unified KSSM Block (Mamba-style, parameter-efficient).
+    """SC-KSSM block with adaptive timestep, convolution, and gates.
 
-    Architecture:
-        1. In-Projection: x -> [z (gate), x_ssm, B_groups, dt_params]
-        2. Conv1d: Local smoothing on x_ssm
-        3. KSSM Scan: Apply Cayley discretization + evolution
-        4. Element-wise C output (no C_proj!)
-        5. Gating: y = scan_out * SiLU(z)
-        6. Out-Projection: y -> output
-
-    Parameter efficiency (vs naive KSSM):
-        - B is grouped (n_B_groups=d_state) and broadcast, not per-channel
-        - C is element-wise weights, not a full projection
-        - Total: ~3.8M params/block (matches Mamba) vs ~10.9M naive
+    Uses:
+    - AdaptiveTimestep: dt = c/(alpha + |omega|)
+    - Conv1dSiLU: Fused CUDA kernel (kernel_size=4)
+    - SelfNormalizingGates: Variance-preserving gates
+    - Input-dependent selection (Mamba-style)
+    - Variance-preserving gating (Griffin RG-LRU)
+    - Phase Modulation Encoding: omega_mod for PME
     """
 
-    def __init__(self, config: KSSMConfig):
+    def __init__(self, config: KSSMConfig, layer_idx: int = 0):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
         self.d_model = config.d_model
         self.d_inner = config.d_inner
-        self.d_conv = config.d_conv
-        self.dt_rank = config.dt_rank
-        self.d_state = config.d_state  # Used for grouped B (like Mamba)
-        self.eps = 1e-6
+        self.n_heads = config.n_heads
+        self.head_dim = config.head_dim
+        self.n_layers = config.n_layers
 
-        # Number of B groups (like Mamba's d_state)
-        self.n_B_groups = self.d_state
+        # Dynamics parameterization: alpha, omega, omega_mod (PME)
+        self._n_dynamics = 3
 
-        # ============================================================
-        # 1. Input Projection (Fused - matches Mamba's param count)
-        # ============================================================
-        # Projects to: z (gate), x (ssm input), B_groups, dt_params
-        # z: d_inner (for gating)
-        # x: d_inner (SSM input)
-        # B_groups: n_B_groups * 2 (grouped 2D state input, broadcast to d_inner)
-        # dt_params: dt_rank (for alpha, omega, dt projection)
-        in_proj_size = self.d_inner * 2 + self.n_B_groups * 2 + self.dt_rank
-        self.in_proj = nn.Linear(self.d_model, in_proj_size, bias=False)
+        # in_proj: [z_gate, K, V]
+        in_proj_size = self.d_inner + self.d_inner * 2 + self.d_inner
+        self.in_proj = nn.Linear(self.d_model, in_proj_size, bias=True)
 
-        # ============================================================
-        # 2. Conv1d for Local Smoothing (Mamba-style)
-        # ============================================================
-        self.conv1d = nn.Conv1d(
-            in_channels=self.d_inner,
-            out_channels=self.d_inner,
-            kernel_size=self.d_conv,
-            groups=self.d_inner,  # Depthwise
-            padding=self.d_conv - 1,  # Causal padding
+        # Fused conv1d + SiLU (CUDA kernel)
+        self.conv = Conv1dSiLU(self.d_inner)
+
+        # Dynamics projection
+        self.dynamics_proj = nn.Linear(
+            self.d_inner,
+            self.n_heads * self._n_dynamics,
             bias=True,
         )
 
-        # ============================================================
-        # 3. KSSM Parameter Projections (from dt_rank to d_inner)
-        # ============================================================
-        self.alpha_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
-        self.omega_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+        # Adaptive timestep
+        self.adaptive_dt = AdaptiveTimestep(self.n_heads)
 
-        # ============================================================
-        # 4. Element-wise C (like Mamba - NO full projection!)
-        # ============================================================
-        # C_weight: (d_inner, 2) - element-wise combination of 2D state
-        # Output: y = sum(states * C_weight, dim=-1)
-        # This saves 4.7M parameters vs C_proj!
-        self.C_weight = nn.Parameter(torch.ones(self.d_inner, 2))
+        # SSD Scanner (Mamba-2 algorithm)
+        self.ssd_scan = SSDChunkwiseScan(self.d_inner, self.n_heads)
 
-        # ============================================================
-        # 5. Output Projection (back to d_model)
-        # ============================================================
+        # ZDG: Zero-Damping Gate with layer-aware initialization
+        self.gates = SelfNormalizingGates(
+            self.d_inner,
+            self.n_heads,
+            layer_idx,
+            config.n_layers,
+        )
+
+        # Input-dependent selection (Mamba-style)
+        self.selection_B = nn.Linear(self.d_inner, self.n_heads * 2, bias=False)
+        self.selection_C = nn.Linear(self.d_inner, self.n_heads * 2, bias=False)
+        self.selection_dt = nn.Linear(self.d_inner, self.n_heads, bias=False)
+
+        # Q projection and output
+        self.Q_proj = nn.Linear(self.d_inner, self.d_inner * 2, bias=False)
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
 
-        # ============================================================
-        # 6. LayerNorm (Pre-norm)
-        # ============================================================
-        self.norm = nn.LayerNorm(self.d_model)
-
-        # D parameter (like Mamba's skip connection)
-        self.D = nn.Parameter(torch.ones(self.d_inner))
+        self.norm = RMSNorm(self.d_model)
+        self.ssm_norm = nn.GroupNorm(config.ssm_norm_groups, self.d_inner)
+        self.D = nn.Parameter(torch.zeros(self.d_inner))
 
         # Initialize weights
         self._init_weights()
 
+        # Apply spectral initialization (uses derived defaults if not calibrated)
+        apply_spectral_init(
+            self,
+            t_min=config.t_min,
+            t_max=config.t_max,
+            freq_min=config.freq_min,
+            freq_max=config.freq_max,
+            n_heads=self.n_heads,
+            layer_idx=layer_idx,
+            n_layers=config.n_layers,
+        )
+
     def _init_weights(self):
-        """Initialize weights following Mamba conventions."""
-        # In projection: small init
-        nn.init.normal_(self.in_proj.weight, std=0.02)
+        """Variance-preserving initialization."""
+        stds = compute_variance_preserving_std(
+            self.d_model,
+            self.d_inner,
+            self.n_layers,
+        )
 
-        # Conv1d: small init
-        nn.init.normal_(self.conv1d.weight, std=0.02)
-        nn.init.zeros_(self.conv1d.bias)
+        nn.init.normal_(self.in_proj.weight, std=stds["in_proj"])
+        nn.init.zeros_(self.in_proj.bias)
 
-        # Alpha projection: init for low damping (long memory)
-        nn.init.zeros_(self.alpha_proj.weight)
-        nn.init.constant_(self.alpha_proj.bias, -5.0)  # softplus(-5) ≈ 0.007
-
-        # Omega projection: log-uniform frequencies
-        nn.init.zeros_(self.omega_proj.weight)
         with torch.no_grad():
-            freqs = torch.exp(torch.linspace(math.log(0.01), math.log(100.0), self.d_inner))
-            self.omega_proj.bias.copy_(freqs)
+            self.in_proj.bias[:self.d_inner].fill_(0.0)  # Z gate: 50% open
+            # K: fan-out correction for 2 state dimensions
+            k_start = self.d_inner
+            k_end = k_start + self.d_inner * 2
+            self.in_proj.weight[k_start:k_end, :].normal_(std=stds["in_proj"] * math.sqrt(2))
+            # V: single state dimension, no correction
+            v_start = k_end
+            v_end = v_start + self.d_inner
+            self.in_proj.weight[v_start:v_end, :].normal_(std=stds["in_proj"])
 
-        # dt projection: log-uniform timesteps
-        nn.init.normal_(self.dt_proj.weight, std=0.02)
+        nn.init.normal_(self.dynamics_proj.weight, std=stds["dynamics_proj"])
+        nn.init.zeros_(self.dynamics_proj.bias)
+
+        # Selection projections: LeCun fan-in scaling for near-neutral start
+        selection_std = 1.0 / math.sqrt(self.d_inner)
+        nn.init.normal_(self.selection_B.weight, std=selection_std)
+        nn.init.normal_(self.selection_C.weight, std=selection_std)
+        nn.init.normal_(self.selection_dt.weight, std=selection_std)
+
+        # Q_proj: identity-like readout (both h0 and h1 dimensions)
+        nn.init.zeros_(self.Q_proj.weight)
         with torch.no_grad():
-            log_dt_min = math.log(self.config.dt_min)
-            log_dt_max = math.log(self.config.dt_max)
-            log_dts = torch.linspace(log_dt_min, log_dt_max, self.d_inner)
-            dts = torch.exp(log_dts)
-            dt_biases = dts + torch.log(-torch.expm1(-dts))
-            self.dt_proj.bias.copy_(dt_biases)
+            W = self.Q_proj.weight.view(self.d_inner, 2, self.d_inner)
+            for i in range(self.d_inner):
+                W[i, 0, i] = 1.0
+                W[i, 1, i] = 1.0
 
-        # C_weight: init to [1, 0] to read first state component by default
-        with torch.no_grad():
-            self.C_weight[:, 0] = 1.0
-            self.C_weight[:, 1] = 0.0
+        nn.init.normal_(self.out_proj.weight, std=stds["out_proj"])
+        nn.init.zeros_(self.D)  # Zero so evolution path receives gradients
 
-        # Output projection
-        nn.init.normal_(self.out_proj.weight, std=0.02)
-
-        # D: ones (skip connection)
-        nn.init.ones_(self.D)
-
-    def forward(
-        self,
-        x: Tensor,
-        state: Tensor | None = None,
-        use_triton: bool = True,
-    ) -> tuple[Tensor, Tensor]:
-        """Forward pass through unified block.
-
-        Args:
-            x: Input tensor, shape (batch, seq, d_model).
-            state: Optional initial state, shape (batch, d_inner, 2).
-            use_triton: Whether to use Triton kernels.
-
-        Returns:
-            output: Output tensor, shape (batch, seq, d_model).
-            final_state: Final state, shape (batch, d_inner, 2).
-        """
+    def forward(self, x: Tensor, state: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        """Forward pass."""
         batch, seq_len, _ = x.shape
         residual = x
 
-        # Pre-norm
         x = self.norm(x)
+        proj = self.in_proj(x)
 
-        # ============================================================
-        # A. Input Projection (Fused GEMM)
-        # ============================================================
-        proj = self.in_proj(x)  # (batch, seq, in_proj_size)
-
-        z, x_ssm, B_groups, dt_params = proj.split(
-            [self.d_inner, self.d_inner, self.n_B_groups * 2, self.dt_rank],
-            dim=-1
+        # Split into z_gate, K, V
+        z, K, V = proj.split(
+            [self.d_inner, self.d_inner * 2, self.d_inner],
+            dim=-1,
         )
-        # z: (batch, seq, d_inner) - gate branch
-        # x_ssm: (batch, seq, d_inner) - SSM input branch
-        # B_groups: (batch, seq, n_B_groups * 2) - grouped input matrix
-        # dt_params: (batch, seq, dt_rank) - compressed params
+        K = K.view(batch, seq_len, self.d_inner, 2)
+        V = V.view(batch, seq_len, self.d_inner, 1)
 
-        # ============================================================
-        # B. Conv1d for Local Smoothing
-        # ============================================================
-        x_conv = x_ssm.transpose(1, 2)
-        x_conv = self.conv1d(x_conv)[:, :, :seq_len]
-        x_conv = x_conv.transpose(1, 2)
-        x_ssm_act = F.silu(x_conv)
+        # Adaptive convolution (includes SiLU)
+        V_conv = self.conv(V.view(batch, seq_len, -1))
+        V_conv = V_conv.view(batch, seq_len, self.d_inner, 1)
 
-        # ============================================================
-        # C. KSSM Parameter Generation
-        # ============================================================
-        alpha = F.softplus(self.alpha_proj(dt_params))
-        omega = self.omega_proj(dt_params)
-        dt = F.softplus(self.dt_proj(dt_params))
+        # Compute dynamics from V
+        V_for_dynamics = V_conv.squeeze(-1)
+        V_for_dynamics_proj = V_for_dynamics.to(self.dynamics_proj.weight.dtype)
+        dynamics = self.dynamics_proj(V_for_dynamics_proj)
 
-        # Expand B from groups to full d_inner (broadcast like Mamba)
-        # B_groups: (batch, seq, n_B_groups, 2)
-        B_groups = B_groups.view(batch, seq_len, self.n_B_groups, 2)
-        # Repeat to match d_inner: each group covers d_inner // n_B_groups channels
-        channels_per_group = self.d_inner // self.n_B_groups
-        B = B_groups.repeat_interleave(channels_per_group, dim=2)  # (batch, seq, d_inner, 2)
+        # Parse dynamics: alpha, omega, omega_mod
+        h = self.n_heads
 
-        # ============================================================
-        # D. KSSM Scan (Fused Cayley + Evolution)
-        # ============================================================
-        states = evolution_fused(
-            alpha, omega, dt, B, x_ssm_act,
-            initial_state=state,
-            eps=self.eps,
-            use_triton=use_triton,
-        )  # (batch, seq, d_inner, 2)
+        # Alpha (softplus for positivity)
+        alpha_base = F.softplus(dynamics[..., :h])
 
-        # ============================================================
-        # E. Element-wise C Output (no projection!)
-        # ============================================================
-        # y = sum(states * C_weight, dim=-1) + D * x_ssm
-        # Match dtype
-        weight_dtype = self.C_weight.dtype
-        if states.dtype != weight_dtype:
-            states = states.to(weight_dtype)
+        # Omega
+        omega_base = dynamics[..., h:2*h]
 
-        y = (states * self.C_weight).sum(dim=-1)  # (batch, seq, d_inner)
-        y = y + self.D * x_ssm_act  # Skip connection (like Mamba's D)
+        # Phase Modulation Encoding
+        omega_mod = dynamics[..., 2*h:3*h]
+        omega = omega_base + omega_mod
 
-        # ============================================================
-        # F. Gating (Replaces MLP!)
-        # ============================================================
+        # Adaptive timestep
+        dt = self.adaptive_dt(alpha_base, omega)
+
+        # Input-dependent selection (Mamba-style): modulate K, Q, dt from input
+        sel_B = self.selection_B(V_for_dynamics_proj)
+        sel_B = sel_B.view(batch, seq_len, self.n_heads, 2)
+        sel_B = sel_B.repeat_interleave(self.head_dim, dim=2)
+        K = K * sel_B  # Input-dependent B modulation
+
+        sel_C = self.selection_C(V_for_dynamics_proj)
+        sel_C = sel_C.view(batch, seq_len, self.n_heads, 2)
+        sel_C = sel_C.repeat_interleave(self.head_dim, dim=2)
+
+        sel_dt = F.softplus(self.selection_dt(V_for_dynamics_proj))
+        dt = dt + sel_dt  # Input-dependent Delta modulation
+
+        # ZDG: Zero-Damping Gate
+        protect_gate, input_gate = self.gates(V_for_dynamics_proj)
+        alpha = alpha_base * (1.0 - protect_gate)
+
+        # Apply input gate to V
+        input_gate_expanded = input_gate.repeat_interleave(
+            self.head_dim, dim=-1
+        ).unsqueeze(-1)
+        V_gated = V_conv * input_gate_expanded
+
+        # Variance-preserving gating (Griffin RG-LRU style)
+        # Scale input injection by sqrt(1 - |eigenvalue(A_bar)|^2)
+        vp_scale = compute_variance_preserving_scale(alpha, omega, dt)
+        vp_scale_expanded = vp_scale.repeat_interleave(
+            self.head_dim, dim=-1
+        ).unsqueeze(-1)
+        V_gated = V_gated * vp_scale_expanded
+
+        # Q projection
+        Q = self.Q_proj(V_for_dynamics_proj).view(batch, seq_len, self.d_inner, 2)
+
+        # Apply input-dependent C selection to Q
+        Q = Q * sel_C
+
+        # Evolution via Cayley discretization (Chunkwise Parallel Scan)
+        # Reshape from flat (B,L,d_inner,X) to per-head (B,L,H,D,X) for SSD
+        K_heads = K.view(batch, seq_len, self.n_heads, self.head_dim, 2)
+        V_gated_heads = V_gated.view(batch, seq_len, self.n_heads, self.head_dim, 1)
+
+        Y, final_state = self.ssd_scan(
+            alpha, omega, dt, K_heads, V_gated_heads, initial_state=state
+        )
+
+        # Reshape SSD output (B, L, H, D, 2) back to (B, L, d_inner, 2) for Q readout
+        Y = Y.reshape(batch, seq_len, self.d_inner, 2)
+        
+        # y = Q^T @ H
+        # Q: (B, L, d_inner, 2)
+        # Y (state): (B, L, d_inner, 2)
+        # Dot product over the last dimension (2)
+        y = (Q * Y).sum(dim=-1) # (B, L, d_inner)
+
+        # GroupNorm in fp32 for numerical stability (matches RMSNorm upcast pattern)
+        y_for_norm = y.float().transpose(1, 2)
+        y = self.ssm_norm(y_for_norm).to(y.dtype).transpose(1, 2)
         y = y * F.silu(z)
+        y = y + self.D * V_conv.view(batch, seq_len, -1)
 
-        # ============================================================
-        # G. Output Projection + Residual
-        # ============================================================
+        y = y.to(self.out_proj.weight.dtype)
         output = self.out_proj(y)
         output = residual + output
-
-        # Extract final state
-        final_state = states[:, -1, :, :]
 
         return output, final_state
-
-    @torch.no_grad()
-    def step(
-        self,
-        x: Tensor,
-        state: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        """Single step for autoregressive inference."""
-        batch = x.shape[0]
-        residual = x
-
-        x = self.norm(x)
-
-        proj = self.in_proj(x)
-        z, x_ssm, B_groups, dt_params = proj.split(
-            [self.d_inner, self.d_inner, self.n_B_groups * 2, self.dt_rank],
-            dim=-1
-        )
-
-        x_ssm_act = F.silu(x_ssm)
-
-        alpha = F.softplus(self.alpha_proj(dt_params))
-        omega = self.omega_proj(dt_params)
-        dt = F.softplus(self.dt_proj(dt_params))
-
-        # Expand B
-        B_groups = B_groups.view(batch, self.n_B_groups, 2)
-        channels_per_group = self.d_inner // self.n_B_groups
-        B = B_groups.repeat_interleave(channels_per_group, dim=1)
-
-        # Single-step KSSM update
-        tau = dt / 2.0
-        one_plus_tau_alpha = 1.0 + tau * alpha
-        tau_omega = tau * omega
-        det_M = one_plus_tau_alpha ** 2 + tau_omega ** 2
-        inv_det = 1.0 / (det_M + self.eps)
-
-        m11 = one_plus_tau_alpha * inv_det
-        m12 = tau_omega * inv_det
-        m21 = -tau_omega * inv_det
-        m22 = one_plus_tau_alpha * inv_det
-
-        one_minus_tau_alpha = 1.0 - tau * alpha
-        a11 = m11 * one_minus_tau_alpha + m12 * (-tau_omega)
-        a12 = m11 * tau_omega + m12 * one_minus_tau_alpha
-        a21 = m21 * one_minus_tau_alpha + m22 * (-tau_omega)
-        a22 = m21 * tau_omega + m22 * one_minus_tau_alpha
-
-        Bx0 = B[..., 0] * x_ssm_act
-        Bx1 = B[..., 1] * x_ssm_act
-        u0 = dt * (m11 * Bx0 + m12 * Bx1)
-        u1 = dt * (m21 * Bx0 + m22 * Bx1)
-
-        h1 = state[..., 0]
-        h2 = state[..., 1]
-        new_h1 = a11 * h1 + a12 * h2 + u0
-        new_h2 = a21 * h1 + a22 * h2 + u1
-        new_state = torch.stack([new_h1, new_h2], dim=-1)
-
-        # Element-wise C output
-        y = (new_state * self.C_weight).sum(dim=-1)
-        y = y + self.D * x_ssm_act
-
-        y = y * F.silu(z)
-        output = self.out_proj(y)
-        output = residual + output
-
-        return output, new_state
-
-    def init_state(self, batch_size: int, device: torch.device = None) -> Tensor:
-        """Initialize state to zeros."""
-        if device is None:
-            device = next(self.parameters()).device
-        return torch.zeros(batch_size, self.d_inner, 2, device=device)
-
-
-# ============================================================
-# Legacy classes for backward compatibility
-# ============================================================
-
-class GatedMLP(nn.Module):
-    """Gated MLP (SwiGLU-style) - LEGACY, kept for compatibility."""
-
-    def __init__(self, d_model: int, expand: int = 2, bias: bool = False):
-        super().__init__()
-        d_hidden = d_model * expand
-        self.gate_proj = nn.Linear(d_model, d_hidden, bias=bias)
-        self.up_proj = nn.Linear(d_model, d_hidden, bias=bias)
-        self.down_proj = nn.Linear(d_hidden, d_model, bias=bias)
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.normal_(self.gate_proj.weight, std=0.02)
-        nn.init.normal_(self.up_proj.weight, std=0.02)
-        nn.init.normal_(self.down_proj.weight, std=0.02)
-
-    def forward(self, x: Tensor) -> Tensor:
-        gate = F.silu(self.gate_proj(x))
-        up = self.up_proj(x)
-        return self.down_proj(gate * up)
-
-
-class KSSMBlockSimple(nn.Module):
-    """Simplified KSSM Block - LEGACY, kept for compatibility."""
-
-    def __init__(
-        self,
-        d_model: int,
-        mlp_expand: int = 2,
-        dt_min: float = 0.001,
-        dt_max: float = 0.1,
-    ):
-        super().__init__()
-        self.d_model = d_model
-
-        from kssm.modules.kssm_layer import KSSMLayerSimple
-
-        self.norm_mixer = nn.LayerNorm(d_model)
-        self.mixer = KSSMLayerSimple(d_model, dt_min, dt_max)
-        self.norm_mlp = nn.LayerNorm(d_model)
-        self.mlp = GatedMLP(d_model, expand=mlp_expand)
-
-    def forward(
-        self,
-        x: Tensor,
-        state: Tensor | None = None,
-        use_triton: bool = True,
-    ) -> tuple[Tensor, Tensor]:
-        residual = x
-        mixer_out, final_state = self.mixer(self.norm_mixer(x), state, use_triton)
-        x = residual + mixer_out
-
-        residual = x
-        x = residual + self.mlp(self.norm_mlp(x))
-
-        return x, final_state
-
-    @torch.no_grad()
-    def step(self, x: Tensor, state: Tensor) -> tuple[Tensor, Tensor]:
-        residual = x
-        mixer_out, new_state = self.mixer.step(self.norm_mixer(x), state)
-        x = residual + mixer_out
-
-        residual = x
-        x = residual + self.mlp(self.norm_mlp(x))
-
-        return x, new_state
-
-    def init_state(self, batch_size: int, device: torch.device = None) -> Tensor:
-        return self.mixer.init_state(batch_size, device)

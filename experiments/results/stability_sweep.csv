@@ -1,7 +1,0 @@
-lr,phase,kssm_diverged,kssm_diverge_step,kssm_final_loss,mamba_diverged,mamba_diverge_step,mamba_final_loss
-0.001,with_layernorm,False,,0.018798828125,False,,0.01513671875
-0.005,with_layernorm,False,,0.025146484375,False,,0.0145263671875
-0.01,with_layernorm,False,,0.01544189453125,False,,0.0128173828125
-0.05,with_layernorm,False,,1.0078125,False,,0.01416015625
-0.1,with_layernorm,False,,1.0,False,,0.07666015625
-0.5,with_layernorm,False,,1.0,True,14,1.078125
