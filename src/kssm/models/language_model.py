@@ -3,9 +3,9 @@
 import torch.nn as nn
 from torch import Tensor
 
-from kssm.config import KSSMConfig
-from kssm.model.backbone import KSSMBackbone
-from kssm.modules.components import compute_variance_preserving_std
+from kssm.config.defaults import KSSMConfig
+from .backbone import KSSMBackbone
+from .components import compute_variance_preserving_std
 
 
 class KSSMLMHeadModel(nn.Module):
@@ -14,12 +14,10 @@ class KSSMLMHeadModel(nn.Module):
     Usage (instant, no data required):
         config = KSSMConfig(d_model=512, n_layers=8)
         model = KSSMLMHeadModel(config, vocab_size=50257)
-
-    Usage (with calibration for optimal accuracy):
-        config = KSSMConfig(d_model=512, n_layers=8)
-        bounds = calibrate_spectral_bounds(dataloader, config.d_model)
-        config = config.with_calibration(**bounds)
-        model = KSSMLMHeadModel(config, vocab_size=50257)
+        
+    Self-Calibration:
+        The model automatically initializes using Universal Spectral Priors
+        based on the `context_length` (default 8192). No manual calibration is needed.
     """
 
     def __init__(self, config: KSSMConfig, vocab_size: int):

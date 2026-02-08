@@ -53,18 +53,25 @@ def _intra_chunk_scan(
 
     # Step 2: Build causal transition kernel L[t,s] = cum_A[t] @ cum_A[s]^{-1}
     # For 2x2 Cayley [[a,b],[-b,a]]: inv = [[a,-b],[b,a]] / (a²+b²)
-    cum_A_inv = cum_A.clone()
-    cum_A_inv[..., 0, 1] = -cum_A[..., 0, 1]
-    cum_A_inv[..., 1, 0] = -cum_A[..., 1, 0]
-    det = cum_A[..., 0, 0].pow(2) + cum_A[..., 0, 1].pow(2)
+    
+    # === FIX: Compute inverse in FP32 to avoid blowups when det is small ===
+    cum_A_fp32 = cum_A.float()
+    cum_A_inv = cum_A_fp32.clone()
+    cum_A_inv[..., 0, 1] = -cum_A_fp32[..., 0, 1]
+    cum_A_inv[..., 1, 0] = -cum_A_fp32[..., 1, 0]
+    det = cum_A_fp32[..., 0, 0].pow(2) + cum_A_fp32[..., 0, 1].pow(2)
     cum_A_inv = cum_A_inv / (det.unsqueeze(-1).unsqueeze(-1) + 1e-8)
 
     # L[t,s] = cum_A[t] @ cum_A_inv[s]
-    L = torch.einsum("bthij,bshjk->btshik", cum_A, cum_A_inv)  # (B*NC, C, C, H, 2, 2)
+    # Compute L in FP32 for precision
+    L = torch.einsum("bthij,bshjk->btshik", cum_A_fp32, cum_A_inv)  # (B*NC, C, C, H, 2, 2)
 
     # Causal mask: L[t,s] = 0 for s > t
-    causal_mask = torch.tril(torch.ones(C, C, device=device, dtype=dtype))
+    causal_mask = torch.tril(torch.ones(C, C, device=device, dtype=torch.float32))
     L = L * causal_mask.view(C, C, 1, 1, 1)
+
+    # Cast back to input dtype for the main data contraction to save memory
+    L = L.to(dtype)
 
     # Step 3: Parallel state computation via single einsum (Tensor Cores)
     local_h = torch.einsum("btshij,bshdj->bthdi", L, U_flat)
@@ -84,14 +91,20 @@ def _inter_chunk_scan(
     dtype = total_A.dtype
     
     chunk_states = torch.empty(B, n_chunks, H, D, 2, device=device, dtype=dtype)
-    state = torch.zeros(B, H, D, 2, device=device, dtype=dtype)
+    
+    # === FIX: Use FP32 for state accumulation to prevent swamping ===
+    state = torch.zeros(B, H, D, 2, device=device, dtype=torch.float32)
+    
+    # Cast inputs to FP32 for the loop
+    total_A_fp32 = total_A.float()
+    final_local_h_fp32 = final_local_h.float()
 
     for k in range(n_chunks):
-        chunk_states[:, k] = state
+        chunk_states[:, k] = state.to(dtype)
 
-        # Update for next chunk
+        # Update for next chunk in FP32
         # h_{k+1_in} = total_A_k @ h_{k_in} + final_local_h_k
-        state = torch.einsum("bhij,bhdj->bhdi", total_A[:, k], state) + final_local_h[:, k]
+        state = torch.einsum("bhij,bhdj->bhdi", total_A_fp32[:, k], state) + final_local_h_fp32[:, k]
 
     return chunk_states
 

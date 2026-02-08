@@ -16,7 +16,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 
 def get_cuda_extensions():
     """Build CUDA extensions."""
-    csrc_dir = _PROJECT_ROOT / "kssm" / "csrc"
+    csrc_dir = _PROJECT_ROOT / "src" / "kssm" / "csrc"
     kernel_dir = csrc_dir / "kernels"
     cu_files = list(kernel_dir.glob("*.cu"))
 

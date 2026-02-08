@@ -12,8 +12,9 @@ dependencies = [
     "pybind11",
     "datasets>=2.14.0",
     "transformers",
+    "PyYAML",
 ]
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["kssm*", "experiments.language*"]
+where = ["src"]
+include = ["kssm*"]

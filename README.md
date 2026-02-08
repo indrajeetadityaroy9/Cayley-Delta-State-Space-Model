@@ -11,86 +11,96 @@
 
 > **Hardware Note:** This implementation is highly optimized for **NVIDIA H100 (Sm90)** GPUs, utilizing `torch.compile` and tensor core instructions for the State Space Duality (SSD) algorithm.
 
-## Research Objectives
+## 1. Project Overview & Research Objectives
 
-Standard State Space Models (SSMs) like Mamba have revolutionized efficient sequence modeling but often rely on heuristic diagonal approximations. KSSM introduces a rigorous physics-informed prior to solve the stability-expressivity tradeoff:
+Standard State Space Models (SSMs) like Mamba have revolutionized efficient sequence modeling but often rely on heuristic diagonal approximations. KSSM introduces a rigorous physics-informed prior to solve the **stability-expressivity tradeoff**:
 
-1.  **Symplectic State Space Duality (S3D):** We generalize the Mamba-2 SSD algorithm to support **Hamiltonian Systems**. By restricting the state matrix $A$ to the Lie algebra of the symplectic group, we guarantee energy conservation (determinant = 1) in the limit of zero damping. This solves the "vanishing memory" problem without requiring $O(N^2)$ attention.
-2.  **Kinetic A-Stability:** We utilize the **Cayley Transform** for discretization. Unlike Zero-Order Hold (ZOH), this maps the left half-plane to the unit disk unconditionally, ensuring stability even for stiff, high-frequency oscillatory dynamics.
-3.  **Parameter-Free Scale Invariance:** An **Adaptive Timestep** mechanism ($dt \propto 1/|\omega|$) automatically normalizes dynamics to the system's natural frequency, removing the need for manual timescale initialization.
+*   **Problem:** Conventional RNNs and SSMs struggle to maintain stable signal propagation over ultra-long contexts due to the "vanishing gradient/memory" problem, or they require $O(N^2)$ attention mechanisms that scale poorly.
+*   **Solution:** KSSM imposes **Symplectic Structure** on the state transition. In a Hamiltonian system, phase space volume is conserved (Liouville's Theorem). By discretizing this structure using the Cayley Transform, we guarantee that the state evolution remains on the unit circle (energy conserving) or spirals strictly inward (stable), never exploding.
 
-## Architecture
+### Core Contributions
+1.  **Symplectic State Space Duality (S3D):** We generalize the Mamba-2 SSD algorithm to support **2x2 Hamiltonian Systems**. By restricting the state matrix $A$ to the Lie algebra of the symplectic group, we guarantee energy conservation (determinant = 1) in the limit of zero damping.
+2.  **Kinetic A-Stability:** We utilize the **Cayley Transform** for discretization. Unlike Zero-Order Hold (ZOH), this maps the left half-plane to the unit disk *unconditionally*, ensuring stability even for stiff, high-frequency oscillatory dynamics.
+3.  **Parameter-Free Scale Invariance:** An **Adaptive Timestep** mechanism ($dt \propto 1/|\omega|$) automatically normalizes dynamics to the system's natural frequency, removing the need for manual timescale initialization (`dt_min`, `dt_max`, `dt_init`).
+4.  **Universal Spectral Priors:** Instead of learned initialization, we initialize the model with a fixed, logarithmic distribution of timescales spanning $[1, L_{context}]$, ensuring all frequencies are captured at initialization.
 
-KSSM is a **Homogeneous Pure SSM** architecture. It relies exclusively on the **KSSM Block** for both mixing and memory.
+## 2. System Architecture
+
+KSSM is a **Homogeneous Pure SSM** architecture. It relies exclusively on the **KSSM Block** for both mixing and memory, without hybrid attention or MLP layers.
 
 ### The KSSM Block
-*   **Dynamics:** 2x2 Block-Diagonal Hamiltonian System ($q, p$ pairs) evolving via $\dot{h} = (J - R)h$.
-*   **Algorithm:** **Chunkwise Parallel Scan (SSD)**.
-    *   **Intra-Chunk:** Parallel associative scan via Tensor Cores.
-    *   **Inter-Chunk:** Sequential passing of symplectic states.
-    *   **Complexity:** $O(L)$ compute, $O(L/Q)$ sequential steps.
-*   **Gating:**
-    *   **Zero-Damping Gate (ZDG):** Dynamically modulates damping $\alpha \to 0$ for lossless storage.
-    *   **Variance-Preserving Input:** Griffin-style gating ensures stable signal propagation at infinite depth.
+The core unit `src/kssm/models/kssm_block.py` composes the following operations:
 
-## Installation
+1.  **Adaptive Timestep:** Computes $\Delta t = \text{softplus}(c) / (\alpha + |\omega| + \epsilon)$.
+2.  **Variance-Preserving Gating:** Modulates input injection $B$ using Griffin-style RG-LRU logic to ensure the signal variance remains constant regardless of sequence depth.
+3.  **Chunkwise Parallel Scan (SSD):**
+    *   **Intra-Chunk:** Fused dual-form recurrence computed via Tensor Core matmuls.
+    *   **Inter-Chunk:** Sequential recurrence of the hidden state $h_t$ across chunks.
+    *   **Complexity:** $O(L)$ time, $O(L/Q)$ sequential steps.
+4.  **Utility Gating:** A sparse "metabolic" gate $u_t$ that can suppress state updates (coasting) when the input is irrelevant, regularized by `METABOLIC_LAMBDA`.
+
+### Directory Structure
+```
+src/kssm/
+├── config/       # Configuration schemas (parameter-free)
+├── data/         # Data loading and tokenization
+├── models/       # Core architecture (Backbone, KSSMBlock, SSD)
+├── ops/          # Fused CUDA kernels
+├── training/     # Training loop and optimization
+└── utils/        # Seeding and checkpointing
+```
+
+## 3. Installation
+
+This codebase requires an environment with **PyTorch 2.1+** and **CUDA 12.x** (for H100 features).
 
 ```bash
 # Clone repository
 git clone https://github.com/your-org/kinetic-state-space-model.git
 cd kinetic-state-space-model
 
-# Install dependencies (requires CUDA 12.x)
+# Install dependencies and compile CUDA extensions
 pip install -e .
 ```
 
-## Usage
+## 4. Usage
 
-### Configuration
-The model is defined by `KSSMConfig`. The architecture is purely defined by `d_model` and `n_layers`.
+### Quick Start
+Initialize a model with zero manual parameter tuning. The configuration is derived purely from `d_model` and `n_layers`.
 
 ```python
-from kssm.config import KSSMConfig
-from kssm.model.backbone import KSSMBackbone
+from kssm.config.defaults import KSSMConfig
+from kssm.models.backbone import KSSMBackbone
 
 # Initialize a purely kinetic model
 config = KSSMConfig(
     d_model=768,
-    n_layers=24
+    n_layers=24,
+    context_length=8192
 )
 
+# Automatically uses Universal Spectral Priors
 model = KSSMBackbone(config)
 ```
 
 ### Reproduction
-Canonical execution path (WikiText-103):
+To reproduce the main WikiText-103 results reported in the paper (or internal benchmarks), use the provided reproduction script. This runs a deterministic training path ensuring valid comparisons.
 
 ```bash
-python reproduce.py --epochs 20 --context-length 1024
+./scripts/reproduce_results.sh
 ```
 
-## References
+Key hyperparameters are defined in `configs/default.yaml`.
+
+## 5. References
 
 This project builds upon and integrates ideas from the following foundational papers:
 
 *   **Mamba-2 / State Space Duality:** Dao, T., & Gu, A. (2024). *Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State Space Duality*. [arXiv:2405.21060](https://arxiv.org/abs/2405.21060)
 *   **Symplectic Recurrent Neural Networks:** Chen, Z., et al. (2020). *Symplectic Recurrent Neural Networks*. [arXiv:1909.13334](https://arxiv.org/abs/1909.13334)
 *   **Structured State Spaces (S4):** Gu, A., et al. (2022). *Efficiently Modeling Long Sequences with Structured State Spaces*. [arXiv:2111.00396](https://arxiv.org/abs/2111.00396)
-
-## Paper Basis For Recent Optimizations
-
-Recent implementation changes were informed by the following arXiv papers:
-
-* **Mamba:** Gu, A., & Dao, T. (2023). *Mamba: Linear-Time Sequence Modeling with Selective State Spaces*. [arXiv:2312.00752](https://arxiv.org/abs/2312.00752)
-* **Mamba-2 / SSD:** Dao, T., & Gu, A. (2024). *Transformers are SSMs*. [arXiv:2405.21060](https://arxiv.org/abs/2405.21060)
-* **PackMamba:** (2024). *PackMamba: High-throughput Mamba for variable-length sequences*. [arXiv:2408.03865](https://arxiv.org/abs/2408.03865)
-* **Falcon-Mamba-7B:** (2024). *The First Competitive Attention-free 7B Language Model*. [arXiv:2410.05355](https://arxiv.org/abs/2410.05355)
-* **HGRN2:** Qin, Z., et al. (2024). *Gated Linear RNNs with State Expansion*. [arXiv:2404.07904](https://arxiv.org/abs/2404.07904)
-* **RULER:** Hsieh, C.-Y., et al. (2024). *What’s the Real Context Size of Your Long-Context Language Models?* [arXiv:2404.06654](https://arxiv.org/abs/2404.06654)
-
-## Important Constraint
-
-Current optimizations improve performance and stability in the implemented path, but they do **not** by themselves prove that all performance issues are resolved. Final claims require workload-specific profiling on the target hardware (H100/SM90) under real training and inference settings.
+*   **Griffin (RG-LRU):** De, S., et al. (2024). *Griffin: Mixing Gated Linear Recurrences with Local Attention for Efficient Language Models*. [arXiv:2402.19427](https://arxiv.org/abs/2402.19427)
+*   **Attention when you need:** Boominathan, L., et al. (2025). *Attention when you need*. [arXiv:2501.07440](https://arxiv.org/abs/2501.07440)
 
 ## License
 

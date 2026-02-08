@@ -3,9 +3,9 @@
 import torch.nn as nn
 from torch import Tensor
 
-from kssm.config import KSSMConfig
-from kssm.modules.kssm_block import KSSMBlock
-from kssm.modules.components import RMSNorm
+from kssm.config.defaults import KSSMConfig, METABOLIC_LAMBDA
+from .kssm_block import KSSMBlock
+from .components import RMSNorm
 
 
 class KSSMBackbone(nn.Module):
@@ -15,12 +15,6 @@ class KSSMBackbone(nn.Module):
 
     Usage (instant, no data required):
         config = KSSMConfig(d_model=512, n_layers=8)
-        backbone = KSSMBackbone(config)
-
-    Usage (with calibration):
-        config = KSSMConfig(d_model=512, n_layers=8)
-        bounds = calibrate_spectral_bounds(dataloader, config.d_model)
-        config = config.with_calibration(**bounds)
         backbone = KSSMBackbone(config)
     """
 
@@ -47,3 +41,19 @@ class KSSMBackbone(nn.Module):
             x = block(x)
 
         return self.final_norm(x)
+
+    def get_metabolic_loss(self) -> Tensor:
+        """Aggregate auxiliary utility loss from all blocks.
+        
+        This applies the standardized sparsity penalty (METABOLIC_LAMBDA)
+        to the mean gate activation.
+
+        Returns:
+            Scalar tensor: Standardized auxiliary loss to be added to the task loss.
+        """
+        total_loss = 0.0
+        for block in self.blocks:
+            if hasattr(block, "_metabolic_loss"):
+                total_loss += block._metabolic_loss
+        
+        return (total_loss / len(self.blocks)) * METABOLIC_LAMBDA

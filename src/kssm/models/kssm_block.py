@@ -1,35 +1,13 @@
-"""KSSM Block: Kinetic State Space Model with Cayley discretization.
-
-Core Evolution Equation:
-    H_t = A_bar @ H_{t-1} + (K * V) * dt
-    y_t = Q^T @ H_t
-
-Cayley Transform (A-stable discretization):
-    A_bar = (I - tau*A)^{-1}(I + tau*A), where tau = dt/2
-
-    For A = [[-alpha, omega], [-omega, -alpha]] with alpha >= 0,
-    the Cayley transform guarantees |eigenvalue(A_bar)| <= 1.
-
-Key Components:
-    - AdaptiveTimestep: dt = c/(alpha + |omega|) for scale-invariance
-    - SelfNormalizingGates: Layer-aware protect/input gates
-    - Conv1dSiLU: Fused CUDA kernel (kernel_size=4)
-
-See: kssm/csrc/include/cayley_math.cuh for implementation details.
-"""
-
 import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from kssm.config import KSSMConfig
-from kssm.modules.ssd import SSDChunkwiseScan
-from kssm.modules.components import (
+from kssm.config.defaults import KSSMConfig
+from .ssd import SSDChunkwiseScan
+from .components import (
     AdaptiveTimestep,
-    SelfNormalizingGates,
     Conv1dSiLU,
     compute_variance_preserving_std,
     compute_variance_preserving_scale,
@@ -44,8 +22,7 @@ class KSSMBlock(nn.Module):
     Uses:
     - AdaptiveTimestep: dt = c/(alpha + |omega|)
     - Conv1dSiLU: Fused CUDA kernel (kernel_size=4)
-    - SelfNormalizingGates: Variance-preserving gates
-    - Input-dependent selection (Mamba-style)
+    - Utility Gating: Sparse attention via metabolic cost
     - Variance-preserving gating (Griffin RG-LRU)
     - Phase Modulation Encoding: omega_mod for PME
     """
@@ -83,13 +60,11 @@ class KSSMBlock(nn.Module):
         # SSD Scanner (Mamba-2 algorithm)
         self.ssd_scan = SSDChunkwiseScan(self.d_inner, self.n_heads)
 
-        # ZDG: Zero-Damping Gate with layer-aware initialization
-        self.gates = SelfNormalizingGates(
-            self.d_inner,
-            self.n_heads,
-            layer_idx,
-            config.n_layers,
-        )
+        # Utility Gating
+        # Predicts "Utility" of current input for the memory
+        # Low utility -> Low attention (gate ~ 0) -> "Coasting"
+        self.utility_gate = nn.Linear(self.d_inner, self.n_heads, bias=True)
+        self._metabolic_loss = 0.0 # Store for external access
 
         # Input-dependent selection (Mamba-style)
         self.selection_B = nn.Linear(self.d_inner, self.n_heads * 2, bias=False)
@@ -107,16 +82,13 @@ class KSSMBlock(nn.Module):
         # Initialize weights
         self._init_weights()
 
-        # Apply spectral initialization (uses derived defaults if not calibrated)
+        # Apply spectral initialization (Universal Priors)
         apply_spectral_init(
             self,
-            t_min=config.t_min,
-            t_max=config.t_max,
-            freq_min=config.freq_min,
-            freq_max=config.freq_max,
             n_heads=self.n_heads,
             layer_idx=layer_idx,
             n_layers=config.n_layers,
+            context_length=config.context_length,
         )
 
     def _init_weights(self):
@@ -149,6 +121,11 @@ class KSSMBlock(nn.Module):
         nn.init.normal_(self.selection_B.weight, std=selection_std)
         nn.init.normal_(self.selection_C.weight, std=selection_std)
         nn.init.normal_(self.selection_dt.weight, std=selection_std)
+
+        # Utility Gate: Initialize to slightly closed (lazy) state
+        # Bias = -1.0 => sigmoid(-1.0) ~= 0.27 (starting with low attention)
+        nn.init.normal_(self.utility_gate.weight, std=selection_std)
+        nn.init.constant_(self.utility_gate.bias, -1.0)
 
         # Q_proj: identity-like readout (both h0 and h1 dimensions)
         nn.init.zeros_(self.Q_proj.weight)
@@ -219,15 +196,8 @@ class KSSMBlock(nn.Module):
         sel_dt = F.softplus(self.selection_dt(V_for_dynamics_proj))
         dt = dt + sel_dt  # Input-dependent Delta modulation
 
-        # ZDG: Zero-Damping Gate
-        protect_gate, input_gate = self.gates(V_for_dynamics_proj)
-        alpha = alpha_base * (1.0 - protect_gate)
-
-        # Apply input gate to V
-        input_gate_expanded = input_gate.unsqueeze(-1).expand(
-            -1, -1, -1, self.head_dim
-        ).reshape(batch, seq_len, self.d_inner).unsqueeze(-1)
-        V_gated = V_conv * input_gate_expanded
+        # Dynamics: Alpha is purely predicted by dynamics_proj
+        alpha = alpha_base
 
         # Variance-preserving gating (Griffin RG-LRU style)
         # Scale input injection by sqrt(1 - |eigenvalue(A_bar)|^2)
@@ -235,7 +205,24 @@ class KSSMBlock(nn.Module):
         vp_scale_expanded = vp_scale.unsqueeze(-1).expand(
             -1, -1, -1, self.head_dim
         ).reshape(batch, seq_len, self.d_inner).unsqueeze(-1)
-        V_gated = V_gated * vp_scale_expanded
+        
+        # Base V_gated is just the convolved V
+        V_gated = V_conv * vp_scale_expanded
+
+        # Utility Gating
+        # u_gate: (B, L, H) in [0, 1]
+        u_gate = torch.sigmoid(self.utility_gate(V_for_dynamics_proj))
+        
+        # Store mean activation for loss computation (L1 sparsity)
+        self._metabolic_loss = u_gate.mean()
+
+        # Modulate V: U = (K * (V * u)) * dt
+        # When u ~ 0, input injection is suppressed, preserving existing state (Coasting)
+        u_gate_expanded = u_gate.unsqueeze(-1).expand(
+            -1, -1, -1, self.head_dim
+        ).reshape(batch, seq_len, self.d_inner).unsqueeze(-1)
+        
+        V_gated = V_gated * u_gate_expanded
 
         # Q projection
         Q = self.Q_proj(V_for_dynamics_proj).view(batch, seq_len, self.d_inner, 2)
