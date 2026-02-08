@@ -161,7 +161,7 @@ class KSSMBlock(nn.Module):
         nn.init.normal_(self.out_proj.weight, std=stds["out_proj"])
         nn.init.zeros_(self.D)  # Zero so evolution path receives gradients
 
-    def forward(self, x: Tensor, state: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor) -> Tensor:
         """Forward pass."""
         batch, seq_len, _ = x.shape
         residual = x
@@ -204,13 +204,17 @@ class KSSMBlock(nn.Module):
 
         # Input-dependent selection (Mamba-style): modulate K, Q, dt from input
         sel_B = self.selection_B(V_for_dynamics_proj)
-        sel_B = sel_B.view(batch, seq_len, self.n_heads, 2)
-        sel_B = sel_B.repeat_interleave(self.head_dim, dim=2)
+        sel_B = sel_B.view(batch, seq_len, self.n_heads, 1, 2)
+        sel_B = sel_B.expand(-1, -1, -1, self.head_dim, -1).reshape(
+            batch, seq_len, self.d_inner, 2
+        )
         K = K * sel_B  # Input-dependent B modulation
 
         sel_C = self.selection_C(V_for_dynamics_proj)
-        sel_C = sel_C.view(batch, seq_len, self.n_heads, 2)
-        sel_C = sel_C.repeat_interleave(self.head_dim, dim=2)
+        sel_C = sel_C.view(batch, seq_len, self.n_heads, 1, 2)
+        sel_C = sel_C.expand(-1, -1, -1, self.head_dim, -1).reshape(
+            batch, seq_len, self.d_inner, 2
+        )
 
         sel_dt = F.softplus(self.selection_dt(V_for_dynamics_proj))
         dt = dt + sel_dt  # Input-dependent Delta modulation
@@ -220,17 +224,17 @@ class KSSMBlock(nn.Module):
         alpha = alpha_base * (1.0 - protect_gate)
 
         # Apply input gate to V
-        input_gate_expanded = input_gate.repeat_interleave(
-            self.head_dim, dim=-1
-        ).unsqueeze(-1)
+        input_gate_expanded = input_gate.unsqueeze(-1).expand(
+            -1, -1, -1, self.head_dim
+        ).reshape(batch, seq_len, self.d_inner).unsqueeze(-1)
         V_gated = V_conv * input_gate_expanded
 
         # Variance-preserving gating (Griffin RG-LRU style)
         # Scale input injection by sqrt(1 - |eigenvalue(A_bar)|^2)
         vp_scale = compute_variance_preserving_scale(alpha, omega, dt)
-        vp_scale_expanded = vp_scale.repeat_interleave(
-            self.head_dim, dim=-1
-        ).unsqueeze(-1)
+        vp_scale_expanded = vp_scale.unsqueeze(-1).expand(
+            -1, -1, -1, self.head_dim
+        ).reshape(batch, seq_len, self.d_inner).unsqueeze(-1)
         V_gated = V_gated * vp_scale_expanded
 
         # Q projection
@@ -244,9 +248,7 @@ class KSSMBlock(nn.Module):
         K_heads = K.view(batch, seq_len, self.n_heads, self.head_dim, 2)
         V_gated_heads = V_gated.view(batch, seq_len, self.n_heads, self.head_dim, 1)
 
-        Y, final_state = self.ssd_scan(
-            alpha, omega, dt, K_heads, V_gated_heads, initial_state=state
-        )
+        Y = self.ssd_scan(alpha, omega, dt, K_heads, V_gated_heads)
 
         # Reshape SSD output (B, L, H, D, 2) back to (B, L, d_inner, 2) for Q readout
         Y = Y.reshape(batch, seq_len, self.d_inner, 2)
@@ -267,4 +269,4 @@ class KSSMBlock(nn.Module):
         output = self.out_proj(y)
         output = residual + output
 
-        return output, final_state
+        return output

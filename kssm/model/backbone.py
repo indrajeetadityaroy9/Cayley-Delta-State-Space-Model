@@ -2,7 +2,6 @@
 
 import torch.nn as nn
 from torch import Tensor
-from torch.utils.checkpoint import checkpoint
 
 from kssm.config import KSSMConfig
 from kssm.modules.kssm_block import KSSMBlock
@@ -44,15 +43,7 @@ class KSSMBackbone(nn.Module):
         Returns:
             output: (batch, seq_len, d_model) - output features
         """
-        use_ckpt = self.training and self.config.n_layers > 4
-
         for block in self.blocks:
-            if use_ckpt:
-                def run_block(x, block=block):
-                    out, _ = block(x, None)
-                    return out
-                x = checkpoint(run_block, x, use_reentrant=False)
-            else:
-                x, _ = block(x, None)
+            x = block(x)
 
         return self.final_norm(x)

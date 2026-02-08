@@ -45,12 +45,11 @@ def _intra_chunk_scan(
     dtype = U_flat.dtype
 
     # Step 1: Sequential prefix products for cum_A (C steps of 2x2 matmul)
-    cum_A_list = []
+    cum_A = torch.empty(batch_chunks, C, H, 2, 2, device=device, dtype=dtype)
     curr_A = torch.eye(2, device=device, dtype=dtype).view(1, 1, 2, 2).expand(batch_chunks, H, 2, 2).contiguous()
     for t in range(C):
         curr_A = torch.matmul(A_flat[:, t], curr_A)
-        cum_A_list.append(curr_A)
-    cum_A = torch.stack(cum_A_list, dim=1)  # (B*NC, C, H, 2, 2)
+        cum_A[:, t] = curr_A
 
     # Step 2: Build causal transition kernel L[t,s] = cum_A[t] @ cum_A[s]^{-1}
     # For 2x2 Cayley [[a,b],[-b,a]]: inv = [[a,-b],[b,a]] / (a²+b²)
@@ -76,7 +75,6 @@ def _intra_chunk_scan(
 def _inter_chunk_scan(
     total_A: Tensor,      # (B, NC, H, 2, 2)
     final_local_h: Tensor, # (B, NC, H, D, 2)
-    initial_state: Tensor | None
 ):
     """
     Sequential recurrence across chunks.
@@ -85,23 +83,17 @@ def _inter_chunk_scan(
     device = total_A.device
     dtype = total_A.dtype
     
-    chunk_states = []
-    
-    if initial_state is None:
-        state = torch.zeros(B, H, D, 2, device=device, dtype=dtype)
-    else:
-        state = initial_state
-        
+    chunk_states = torch.empty(B, n_chunks, H, D, 2, device=device, dtype=dtype)
+    state = torch.zeros(B, H, D, 2, device=device, dtype=dtype)
+
     for k in range(n_chunks):
-        # Save state BEFORE update (this is the init state entering chunk k)
-        chunk_states.append(state)
-        
+        chunk_states[:, k] = state
+
         # Update for next chunk
         # h_{k+1_in} = total_A_k @ h_{k_in} + final_local_h_k
         state = torch.einsum("bhij,bhdj->bhdi", total_A[:, k], state) + final_local_h[:, k]
-        
-    chunk_states = torch.stack(chunk_states, dim=1) # (B, NC, H, D, 2)
-    return chunk_states, state
+
+    return chunk_states
 
 class SSDChunkwiseScan(nn.Module):
     """Chunkwise Parallel Scan for KSSM."""
@@ -120,8 +112,7 @@ class SSDChunkwiseScan(nn.Module):
         dt: Tensor,
         K: Tensor,
         V: Tensor,
-        initial_state: Tensor | None = None
-    ) -> tuple[Tensor, Tensor]:
+    ) -> Tensor:
         """
         Args:
             alpha, omega, dt: (B, L, H)
@@ -187,7 +178,7 @@ class SSDChunkwiseScan(nn.Module):
         final_local_h = local_h[:, :, -1] # (B, NC, H, D, 2)
         
         # === 5. Inter-Chunk Recurrence (Global) ===
-        chunk_states, final_state = _inter_chunk_scan(total_A, final_local_h, initial_state)
+        chunk_states = _inter_chunk_scan(total_A, final_local_h)
         
         # === 6. Correction (Broadcast) ===
         # True h_{t} = local_h_{t} + (cum_A_{t} @ chunk_state_{k})
@@ -206,4 +197,4 @@ class SSDChunkwiseScan(nn.Module):
         if pad_len > 0:
             Y = Y[:, :L]
             
-        return Y, final_state
+        return Y

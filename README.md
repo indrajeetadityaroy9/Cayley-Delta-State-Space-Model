@@ -63,17 +63,10 @@ model = KSSMBackbone(config)
 ```
 
 ### Reproduction
-We provide a unified entry point `reproduce.py` for all experiments.
+Canonical execution path (WikiText-103):
 
 ```bash
-# 1. Multi-Query Associative Recall (Long-Context Validation)
-python reproduce.py --experiment mqar
-
-# 2. System Scaling Benchmark (Throughput/Memory)
-python reproduce.py --experiment scaling_benchmark
-
-# 3. Language Modeling (WikiText-103)
-python reproduce.py --experiment wikitext
+python reproduce.py --epochs 20 --context-length 1024
 ```
 
 ## References
@@ -83,6 +76,21 @@ This project builds upon and integrates ideas from the following foundational pa
 *   **Mamba-2 / State Space Duality:** Dao, T., & Gu, A. (2024). *Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State Space Duality*. [arXiv:2405.21060](https://arxiv.org/abs/2405.21060)
 *   **Symplectic Recurrent Neural Networks:** Chen, Z., et al. (2020). *Symplectic Recurrent Neural Networks*. [arXiv:1909.13334](https://arxiv.org/abs/1909.13334)
 *   **Structured State Spaces (S4):** Gu, A., et al. (2022). *Efficiently Modeling Long Sequences with Structured State Spaces*. [arXiv:2111.00396](https://arxiv.org/abs/2111.00396)
+
+## Paper Basis For Recent Optimizations
+
+Recent implementation changes were informed by the following arXiv papers:
+
+* **Mamba:** Gu, A., & Dao, T. (2023). *Mamba: Linear-Time Sequence Modeling with Selective State Spaces*. [arXiv:2312.00752](https://arxiv.org/abs/2312.00752)
+* **Mamba-2 / SSD:** Dao, T., & Gu, A. (2024). *Transformers are SSMs*. [arXiv:2405.21060](https://arxiv.org/abs/2405.21060)
+* **PackMamba:** (2024). *PackMamba: High-throughput Mamba for variable-length sequences*. [arXiv:2408.03865](https://arxiv.org/abs/2408.03865)
+* **Falcon-Mamba-7B:** (2024). *The First Competitive Attention-free 7B Language Model*. [arXiv:2410.05355](https://arxiv.org/abs/2410.05355)
+* **HGRN2:** Qin, Z., et al. (2024). *Gated Linear RNNs with State Expansion*. [arXiv:2404.07904](https://arxiv.org/abs/2404.07904)
+* **RULER:** Hsieh, C.-Y., et al. (2024). *What’s the Real Context Size of Your Long-Context Language Models?* [arXiv:2404.06654](https://arxiv.org/abs/2404.06654)
+
+## Important Constraint
+
+Current optimizations improve performance and stability in the implemented path, but they do **not** by themselves prove that all performance issues are resolved. Final claims require workload-specific profiling on the target hardware (H100/SM90) under real training and inference settings.
 
 ## License
 
