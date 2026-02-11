@@ -26,17 +26,22 @@ def load_config(config_path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/default.yaml")
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
     config_dict = load_config(args.config)
-    seed_everything(config_dict.get("seed", 42))
+    seed = args.seed if args.seed is not None else config_dict.get("seed", 42)
+    seed_everything(seed)
 
     device = torch.device(config_dict["training"]["device"])
-    
+
     # Data
     context_length = config_dict["data"]["context_length"]
     train_dataset = WikiTextDataset("train", context_length)
     val_dataset = WikiTextDataset("validation", context_length)
+
+    vocab_size = train_dataset.tokenizer.vocab_size
+    n_layers = config_dict["model"]["n_layers"]
 
     train_loader = DataLoader(
         train_dataset,
@@ -60,28 +65,28 @@ def main():
         prefetch_factor=config_dict["data"]["prefetch_factor"],
     )
 
-    # Model
+    # Model (vocab_size now part of config for derived constants)
     model_config = KSSMConfig(
         d_model=config_dict["model"]["d_model"],
-        n_layers=config_dict["model"]["n_layers"],
+        n_layers=n_layers,
         context_length=context_length,
+        vocab_size=vocab_size,
     )
-    vocab_size = train_dataset.tokenizer.vocab_size
     model = KSSMLMHeadModel(model_config, vocab_size).to(device)
     if config_dict["training"]["precision"] == "bfloat16":
         model = model.bfloat16()
-    
+
     model = torch.compile(model, mode="reduce-overhead")
 
-    # Optimizer
-    param_groups = build_param_groups(model, base_lr=float(config_dict["training"]["base_lr"]))
+    # Optimizer (SSM LR ratio derived from n_layers)
+    param_groups = build_param_groups(model, base_lr=float(config_dict["training"]["base_lr"]), n_layers=n_layers)
     optimizer = torch.optim.AdamW(
-        param_groups, 
-        weight_decay=config_dict["training"]["weight_decay"], 
-        betas=tuple(config_dict["training"]["betas"]), 
+        param_groups,
+        weight_decay=config_dict["training"]["weight_decay"],
+        betas=tuple(config_dict["training"]["betas"]),
         fused=True
     )
-    
+
     grad_accum_steps = config_dict["training"]["grad_accum_steps"]
     epochs = config_dict["training"]["epochs"]
     total_steps = len(train_loader) * epochs // grad_accum_steps
@@ -89,18 +94,20 @@ def main():
 
     best_val_ppl = float("inf")
     checkpoint_dir = Path(config_dict["checkpointing"]["save_dir"])
-    
+
+    # PPL clamp derived from vocab size
+    ppl_clamp = math.log(vocab_size)
+
     print(f"Starting training for {epochs} epochs...")
 
     for epoch in range(1, epochs + 1):
-        print(f"
-=== Epoch {epoch}/{epochs} ===")
-        train_loss = train_one_epoch(model, train_loader, optimizer, scheduler, device, grad_accum_steps)
+        print(f"\n=== Epoch {epoch}/{epochs} ===")
+        train_loss = train_one_epoch(model, train_loader, optimizer, scheduler, device, grad_accum_steps, vocab_size=vocab_size)
         val_loss = evaluate_epoch(model, val_loader, device)
 
-        train_ppl = math.exp(min(train_loss, 20.0))
-        val_ppl = math.exp(min(val_loss, 20.0))
-        
+        train_ppl = math.exp(min(train_loss, ppl_clamp))
+        val_ppl = math.exp(min(val_loss, ppl_clamp))
+
         print(f"Train PPL: {train_ppl:.2f} | Val PPL: {val_ppl:.2f}")
 
         if val_ppl < best_val_ppl:
@@ -113,7 +120,7 @@ def main():
                 path=checkpoint_dir / f"{config_dict['experiment_name']}_best.pt",
                 optimizer=optimizer,
                 metrics={"best_val_ppl": best_val_ppl, "epoch": epoch},
-                seed=config_dict.get("seed", 42)
+                seed=seed
             )
             print(f"Saved best model (PPL: {best_val_ppl:.2f})")
 

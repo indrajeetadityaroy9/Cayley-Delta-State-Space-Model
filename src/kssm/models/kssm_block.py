@@ -24,13 +24,13 @@ class KSSMBlock(nn.Module):
     unconditionally (A-stability). With alpha > 0 the dynamics are dissipative
     (not exactly symplectic), providing controllable decay alongside rotation.
 
-    Components:
-    - AdaptiveTimestep: dt = c/(alpha + |omega|) for scale-invariant dynamics
-    - Conv1dSiLU: Fused CUDA depthwise conv1d + SiLU (kernel_size=4)
-    - Delta-rule state update with selective erasure via beta gate
-    - Learned recurrence gate (Griffin RG-LRU style) for variance-preserving gating
-    - Utility gating with state-conditioned feedback for metabolic sparsity
-    - Position encoding via omega modulation (RoPE-like)
+    Architecture:
+    - Decoupled gate pathway: x_gate feeds conv, dynamics, selection, gates
+    - Matrix memory: state S ∈ R^(2×D) per head for proper delta-rule retrieval
+    - Recurrence gate modulates A_bar eigenvalue (Griffin RG-LRU)
+    - L2-normalized keys and queries for delta-rule stability
+    - EMA energy feedback for utility gating (no cross-batch leakage)
+    - Position encoding via RoPE-like omega modulation
     """
 
     def __init__(self, config: KSSMConfig, layer_idx: int = 0):
@@ -43,20 +43,24 @@ class KSSMBlock(nn.Module):
         self.head_dim = config.head_dim
         self.n_layers = config.n_layers
 
-        # Dynamics parameterization: alpha, omega, omega_mod (PME)
-        self._n_dynamics = 3
+        # Derived gating range: c = log(context_length)
+        self._gating_c = math.log(config.context_length)
 
-        # in_proj: [z_gate, K, V]
-        in_proj_size = self.d_inner + self.d_inner * 2 + self.d_inner
+        # in_proj: [z_gate, x_gate, K, V]
+        # z: d_inner (output gate)
+        # x_gate: d_inner (feeds conv -> dynamics/selection/gates)
+        # K: d_inner (D-dimensional keys per head)
+        # V: n_heads * 2 (2D Hamiltonian value vectors per head)
+        in_proj_size = self.d_inner * 3 + self.n_heads * 2
         self.in_proj = nn.Linear(self.d_model, in_proj_size, bias=True)
 
-        # Fused conv1d + SiLU (CUDA kernel)
+        # Fused conv1d + SiLU (CUDA kernel) — on gate pathway
         self.conv = Conv1dSiLU(self.d_inner)
 
-        # Dynamics projection
+        # Dynamics projection: alpha + omega (2 outputs per head)
         self.dynamics_proj = nn.Linear(
             self.d_inner,
-            self.n_heads * self._n_dynamics,
+            self.n_heads * 2,
             bias=True,
         )
 
@@ -64,15 +68,13 @@ class KSSMBlock(nn.Module):
         self.adaptive_dt = AdaptiveTimestep(self.n_heads)
 
         # SSD Scanner (Mamba-2 algorithm)
-        self.ssd_scan = SSDChunkwiseScan(self.d_inner, self.n_heads)
+        self.ssd_scan = SSDChunkwiseScan(self.d_inner, self.n_heads, gating_c=self._gating_c)
 
-        # Utility Gating (state-conditioned)
-        # Predicts "Utility" of current input for the memory
-        # Low utility -> Low attention (gate ~ 0) -> "Coasting"
+        # Utility Gating (state-conditioned via EMA energy)
         self.utility_gate = nn.Linear(self.d_inner, self.n_heads, bias=True)
         self.state_gate_proj = nn.Linear(self.n_heads, self.n_heads, bias=False)
-        self._metabolic_loss = 0.0  # Store for external access
-        self._cached_chunk_states = None  # Cached from previous forward pass
+        self._metabolic_loss = 0.0
+        self.register_buffer('_ema_energy', torch.zeros(self.n_heads), persistent=False)
 
         # Delta-rule update gate (beta)
         self.beta_proj = nn.Linear(self.d_inner, self.n_heads, bias=True)
@@ -84,13 +86,18 @@ class KSSMBlock(nn.Module):
         freqs = 1.0 / (10000 ** (torch.arange(0, self.n_heads, dtype=torch.float32) / self.n_heads))
         self.register_buffer("rope_freqs", freqs, persistent=False)
 
-        # Input-dependent selection (Mamba-style)
-        self.selection_B = nn.Linear(self.d_inner, self.n_heads * 2, bias=False)
-        self.selection_C = nn.Linear(self.d_inner, self.n_heads * 2, bias=False)
+        # Input-dependent selection (Mamba-style) — per-head scalars
+        self.selection_B = nn.Linear(self.d_inner, self.n_heads, bias=False)
+        self.selection_C = nn.Linear(self.d_inner, self.n_heads, bias=False)
         self.selection_dt = nn.Linear(self.d_inner, self.n_heads, bias=False)
 
-        # Q projection and output
-        self.Q_proj = nn.Linear(self.d_inner, self.d_inner * 2, bias=False)
+        # Q projection: D-dimensional query per head
+        self.Q_proj = nn.Linear(self.d_inner, self.d_inner, bias=False)
+
+        # Readout projection: maps retrieved 2-vectors back to feature space
+        self.readout_proj = nn.Linear(self.n_heads * 2, self.d_inner, bias=False)
+
+        # Output projection
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
 
         self.norm = RMSNorm(self.d_model)
@@ -100,14 +107,19 @@ class KSSMBlock(nn.Module):
         # Initialize weights
         self._init_weights()
 
-        # Apply spectral initialization (Universal Priors)
-        apply_spectral_init(
+        # Apply spectral initialization (returns per-head timescales)
+        tau_h = apply_spectral_init(
             self,
             n_heads=self.n_heads,
             layer_idx=layer_idx,
             n_layers=config.n_layers,
             context_length=config.context_length,
         )
+
+        # Per-head EMA decay aligned to spectral timescale
+        # Fast heads (τ≈1) → decay≈0.9, slow heads (τ≈8192) → decay≈0.999
+        ema_decay = (1.0 - 1.0 / tau_h).clamp(0.9, 0.999)
+        self.register_buffer('_ema_decay', ema_decay, persistent=False)
 
     def _init_weights(self):
         """Variance-preserving initialization."""
@@ -122,14 +134,17 @@ class KSSMBlock(nn.Module):
 
         with torch.no_grad():
             self.in_proj.bias[:self.d_inner].fill_(0.0)  # Z gate: 50% open
-            # K: fan-out correction for 2 state dimensions
-            k_start = self.d_inner
-            k_end = k_start + self.d_inner * 2
-            self.in_proj.weight[k_start:k_end, :].normal_(std=stds["in_proj"] * math.sqrt(2))
-            # V: single state dimension, no correction
+            # x_gate: standard init (already done by normal_ above)
+            # K: standard init, D-dimensional
+            k_start = self.d_inner * 2
+            k_end = k_start + self.d_inner
+            self.in_proj.weight[k_start:k_end, :].normal_(std=stds["in_proj"])
+            # V: n_heads * 2, small init
             v_start = k_end
-            v_end = v_start + self.d_inner
-            self.in_proj.weight[v_start:v_end, :].normal_(std=stds["in_proj"])
+            v_end = v_start + self.n_heads * 2
+            self.in_proj.weight[v_start:v_end, :].normal_(
+                std=stds["in_proj"] / math.sqrt(self.head_dim)
+            )
 
         nn.init.normal_(self.dynamics_proj.weight, std=stds["dynamics_proj"])
         nn.init.zeros_(self.dynamics_proj.bias)
@@ -149,23 +164,20 @@ class KSSMBlock(nn.Module):
         nn.init.constant_(self.recurrence_gate.bias, 1.0)
 
         # Utility Gate: Initialize to slightly closed (lazy) state
-        # Bias = -1.0 => sigmoid(-1.0) ~= 0.27 (starting with low attention)
         nn.init.normal_(self.utility_gate.weight, std=selection_std)
         nn.init.constant_(self.utility_gate.bias, -1.0)
 
         # State gate: small init so state feedback starts weak
         nn.init.normal_(self.state_gate_proj.weight, std=0.01)
 
-        # Q_proj: identity-like readout (both h0 and h1 dimensions)
-        nn.init.zeros_(self.Q_proj.weight)
-        with torch.no_grad():
-            W = self.Q_proj.weight.view(self.d_inner, 2, self.d_inner)
-            for i in range(self.d_inner):
-                W[i, 0, i] = 1.0
-                W[i, 1, i] = 1.0
+        # Q_proj: identity-like initialization
+        nn.init.eye_(self.Q_proj.weight)
+
+        # Readout projection
+        nn.init.normal_(self.readout_proj.weight, std=1.0 / math.sqrt(self.n_heads * 2))
 
         nn.init.normal_(self.out_proj.weight, std=stds["out_proj"])
-        nn.init.zeros_(self.D)  # Zero so evolution path receives gradients
+        nn.init.zeros_(self.D)
 
     def forward(self, x: Tensor) -> Tensor:
         """Forward pass."""
@@ -175,35 +187,29 @@ class KSSMBlock(nn.Module):
         x = self.norm(x)
         proj = self.in_proj(x)
 
-        # Split into z_gate, K, V
-        z, K, V = proj.split(
-            [self.d_inner, self.d_inner * 2, self.d_inner],
+        # Split into z_gate, x_gate, K, V
+        z, x_gate, K, V = proj.split(
+            [self.d_inner, self.d_inner, self.d_inner, self.n_heads * 2],
             dim=-1,
         )
-        K = K.view(batch, seq_len, self.d_inner, 2)
-        V = V.view(batch, seq_len, self.d_inner, 1)
+        K = K.view(batch, seq_len, self.n_heads, self.head_dim)  # (B, L, H, D)
+        V = V.view(batch, seq_len, self.n_heads, 2)               # (B, L, H, 2)
 
-        # Adaptive convolution (includes SiLU)
-        V_conv = self.conv(V.view(batch, seq_len, -1))
-        V_conv = V_conv.view(batch, seq_len, self.d_inner, 1)
+        # Conv on gate pathway (decoupled from V)
+        x_conv = self.conv(x_gate)  # (B, L, d_inner)
 
-        # Compute dynamics from V
-        V_for_dynamics = V_conv.squeeze(-1)
-        V_for_dynamics_proj = V_for_dynamics.to(self.dynamics_proj.weight.dtype)
-        dynamics = self.dynamics_proj(V_for_dynamics_proj)
+        # Compute dynamics from gate pathway
+        x_conv_cast = x_conv.to(self.dynamics_proj.weight.dtype)
+        dynamics = self.dynamics_proj(x_conv_cast)
 
-        # Parse dynamics: alpha, omega, omega_mod
+        # Parse dynamics: alpha, omega
         h = self.n_heads
 
         # Alpha (softplus for positivity)
         alpha_base = F.softplus(dynamics[..., :h])
 
         # Omega
-        omega_base = dynamics[..., h:2*h]
-
-        # Phase Modulation Encoding
-        omega_mod = dynamics[..., 2*h:3*h]
-        omega = omega_base + omega_mod
+        omega = dynamics[..., h:2*h]
 
         # Position encoding via omega modulation (RoPE-like)
         positions = torch.arange(seq_len, device=x.device, dtype=omega.dtype).unsqueeze(0).unsqueeze(-1)
@@ -212,100 +218,73 @@ class KSSMBlock(nn.Module):
         # Adaptive timestep
         dt = self.adaptive_dt(alpha_base, omega)
 
-        # Input-dependent selection (Mamba-style): modulate K, Q, dt from input
-        sel_B = self.selection_B(V_for_dynamics_proj)
-        sel_B = sel_B.view(batch, seq_len, self.n_heads, 1, 2)
-        sel_B = sel_B.expand(-1, -1, -1, self.head_dim, -1).reshape(
-            batch, seq_len, self.d_inner, 2
-        )
-        K = K * sel_B  # Input-dependent B modulation
+        # Input-dependent selection (Mamba-style): per-head scalars
+        sel_B = self.selection_B(x_conv_cast).unsqueeze(-1)  # (B, L, H, 1)
+        K = K * sel_B  # (B, L, H, D) * (B, L, H, 1)
 
-        sel_C = self.selection_C(V_for_dynamics_proj)
-        sel_C = sel_C.view(batch, seq_len, self.n_heads, 1, 2)
-        sel_C = sel_C.expand(-1, -1, -1, self.head_dim, -1).reshape(
-            batch, seq_len, self.d_inner, 2
-        )
+        sel_C = self.selection_C(x_conv_cast).unsqueeze(-1)  # (B, L, H, 1)
 
-        sel_dt = F.softplus(self.selection_dt(V_for_dynamics_proj))
-        dt = dt + sel_dt  # Input-dependent Delta modulation
+        sel_dt = F.softplus(self.selection_dt(x_conv_cast))
+        dt = dt + sel_dt
 
         # Dynamics: Alpha is purely predicted by dynamics_proj
         alpha = alpha_base
 
         # Learned recurrence gate (Griffin RG-LRU style)
-        r_gate = torch.sigmoid(self.recurrence_gate(V_for_dynamics_proj))  # (B, L, H)
+        r_gate = torch.sigmoid(self.recurrence_gate(x_conv_cast))  # (B, L, H)
 
         # Variance-preserving gating with learned recurrence gate
-        # Scale input injection by sqrt(1 - |effective_eigenvalue|^2)
-        vp_scale = compute_variance_preserving_scale_gated(alpha, omega, dt, r_gate)
-        vp_scale_expanded = vp_scale.unsqueeze(-1).expand(
-            -1, -1, -1, self.head_dim
-        ).reshape(batch, seq_len, self.d_inner).unsqueeze(-1)
-        
-        # Base V_gated is just the convolved V
-        V_gated = V_conv * vp_scale_expanded
+        vp_scale = compute_variance_preserving_scale_gated(alpha, omega, dt, r_gate, c=self._gating_c)
+        V_gated = V * vp_scale.unsqueeze(-1)  # (B, L, H, 2) * (B, L, H, 1)
 
-        # State-conditioned utility gating
-        # u_gate: (B, L, H) in [0, 1]
-        u_logit = self.utility_gate(V_for_dynamics_proj)  # (B, L, H)
-
-        # Add state feedback from previous forward pass (if available)
-        if self._cached_chunk_states is not None:
-            # Reduce (B, NC, H, D, 2) -> (B, NC, H) via mean energy per head
-            state_energy = self._cached_chunk_states.pow(2).sum(-1).mean(-1)
-            state_signal = self.state_gate_proj(state_energy)  # (B, NC, H)
-            # Upsample from chunk-level to token-level
-            state_signal = state_signal.repeat_interleave(
-                self.ssd_scan.chunk_size, dim=1
-            )[:, :seq_len]  # (B, L, H)
-            u_logit = u_logit + state_signal
+        # State-conditioned utility gating via EMA energy
+        state_signal = self.state_gate_proj(self._ema_energy)  # (H,)
+        u_logit = self.utility_gate(x_conv_cast) + state_signal  # broadcast to (B, L, H)
 
         u_gate = torch.sigmoid(u_logit)
 
         # Store mean activation for loss computation (L1 sparsity)
         self._metabolic_loss = u_gate.mean()
 
-        # Modulate V: U = (K * (V * u)) * dt
-        # When u ~ 0, input injection is suppressed, preserving existing state (Coasting)
-        u_gate_expanded = u_gate.unsqueeze(-1).expand(
-            -1, -1, -1, self.head_dim
-        ).reshape(batch, seq_len, self.d_inner).unsqueeze(-1)
-        
-        V_gated = V_gated * u_gate_expanded
+        # Modulate V with utility gate
+        V_gated = V_gated * u_gate.unsqueeze(-1)  # (B, L, H, 2) * (B, L, H, 1)
 
-        # Q projection
-        Q = self.Q_proj(V_for_dynamics_proj).view(batch, seq_len, self.d_inner, 2)
+        # L2-normalize keys for delta-rule stability
+        K = F.normalize(K, dim=-1)
 
-        # Apply input-dependent C selection to Q
-        Q = Q * sel_C
+        # Q projection: D-dimensional query per head
+        Q = self.Q_proj(x_conv_cast).view(batch, seq_len, self.n_heads, self.head_dim)
+        Q = Q * sel_C  # (B, L, H, D) * (B, L, H, 1)
+
+        # L2-normalize queries for delta-rule stability
+        Q = F.normalize(Q, dim=-1)
 
         # Delta-rule update gate
-        beta = torch.sigmoid(self.beta_proj(V_for_dynamics_proj))  # (B, L, H)
+        beta = torch.sigmoid(self.beta_proj(x_conv_cast))  # (B, L, H)
 
         # Evolution via Cayley discretization (Chunkwise Parallel Scan)
-        # Reshape from flat (B,L,d_inner,X) to per-head (B,L,H,D,X) for SSD
-        K_heads = K.view(batch, seq_len, self.n_heads, self.head_dim, 2)
-        V_gated_heads = V_gated.view(batch, seq_len, self.n_heads, self.head_dim, 1)
+        Y, chunk_states = self.ssd_scan(
+            alpha, omega, dt, K, V_gated, beta=beta, r_gate=r_gate,
+        )
 
-        Y, chunk_states = self.ssd_scan(alpha, omega, dt, K_heads, V_gated_heads, beta=beta)
+        # Update EMA energy from chunk states
+        if self.training:
+            # chunk_states: (B, NC, H, 2, D) -> energy per head
+            current_energy = chunk_states.pow(2).sum(dim=(-1, -2)).mean(dim=(0, 1))  # (H,)
+            self._ema_energy = self._ema_decay * self._ema_energy + (1.0 - self._ema_decay) * current_energy.detach()
 
-        # Cache chunk states for state-conditioned gating in next forward pass
-        self._cached_chunk_states = chunk_states.detach()
+        # Readout: retrieve 2-vectors from matrix state using Q
+        # Y: (B, L, H, 2, D), Q: (B, L, H, D) -> retrieved: (B, L, H, 2)
+        retrieved = torch.einsum('blhsd,blhd->blhs', Y, Q)
 
-        # Reshape SSD output (B, L, H, D, 2) back to (B, L, d_inner, 2) for Q readout
-        Y = Y.reshape(batch, seq_len, self.d_inner, 2)
-        
-        # y = Q^T @ H
-        # Q: (B, L, d_inner, 2)
-        # Y (state): (B, L, d_inner, 2)
-        # Dot product over the last dimension (2)
-        y = (Q * Y).sum(dim=-1) # (B, L, d_inner)
+        # Project retrieved 2-vectors back to feature space
+        y = self.readout_proj(retrieved.reshape(batch, seq_len, -1))  # (B, L, d_inner)
 
-        # GroupNorm in fp32 for numerical stability (matches RMSNorm upcast pattern)
+        # GroupNorm in fp32 for numerical stability
         y_for_norm = y.float().transpose(1, 2)
         y = self.ssm_norm(y_for_norm).to(y.dtype).transpose(1, 2)
         y = y * F.silu(z)
-        y = y + self.D * V_conv.view(batch, seq_len, -1)
+        y = y + self.D * x_conv
 
         y = y.to(self.out_proj.weight.dtype)
         output = self.out_proj(y)

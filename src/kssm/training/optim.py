@@ -2,7 +2,9 @@ import math
 import torch
 import torch.nn as nn
 
-def build_param_groups(model: nn.Module, base_lr: float) -> list[dict]:
+from kssm.config.defaults import derived_ssm_lr_ratio
+
+def build_param_groups(model: nn.Module, base_lr: float, n_layers: int) -> list[dict]:
     ssm_keywords = [
         "dynamics_proj",
         "adaptive_dt",
@@ -22,9 +24,13 @@ def build_param_groups(model: nn.Module, base_lr: float) -> list[dict]:
             ssm_params.append(param)
         else:
             other_params.append(param)
+
+    # SSM LR = base_lr / sqrt(2 * n_layers), T-Fixup aligned depth scaling
+    ssm_lr = base_lr * derived_ssm_lr_ratio(n_layers)
+
     return [
         {"params": other_params, "lr": base_lr},
-        {"params": ssm_params, "lr": base_lr * 0.1},
+        {"params": ssm_params, "lr": ssm_lr},
     ]
 
 

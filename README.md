@@ -42,17 +42,23 @@ where $\beta_t = \sigma(\text{beta\_proj}(x_t)) \in [0,1]$ is a learned gate. Th
 
 A learned gate $r_t = \sigma(\text{recurrence\_gate}(x_t))$ modulates the effective eigenvalue decay independent of the Hamiltonian parameters (De et al., 2024):
 
-$$|\lambda_{\text{eff}}|^2 = |\lambda(\bar{A})|^{2 \cdot c \cdot r_t}, \quad c = 8$$
+$$|\lambda_{\text{eff}}|^2 = |\lambda(\bar{A})|^{2 \cdot c \cdot r_t}, \quad c = \ln(T)$$
 
-When $r_t \to 0$, the effective eigenvalue approaches 1 (state held). When $r_t \to 1$, the decay is amplified by $c = 8$ (state flushed). The variance-preserving input scale $\sqrt{1 - |\lambda_{\text{eff}}|^2}$ ensures signal magnitude is preserved across the recurrence regardless of the gate setting.
+where $T$ is the context length. The gating range $c$ is derived from the sequence length rather than set manually — longer contexts require stronger flushing capability. For $T = 8192$, $c \approx 9.0$; for $T = 1024$, $c \approx 6.9$. When $r_t \to 0$, the effective eigenvalue approaches 1 (state held). When $r_t \to 1$, the decay is amplified by $c$ (state flushed). A-stability is preserved for all $c > 0$ since $|\lambda| \leq 1$ implies $|\lambda|^{cr} \leq 1$. The variance-preserving input scale $\sqrt{1 - |\lambda_{\text{eff}}|^2}$ ensures signal magnitude is preserved across the recurrence regardless of the gate setting.
 
 ### 2.4 State-Conditioned Utility Gating
 
 A utility gate $u_t \in [0,1]$ suppresses input injection when the current input is irrelevant to the memory state, enabling "metabolic coasting" (Boominathan et al., 2025):
 
-$$u_t = \sigma\!\left(\text{utility\_gate}(x_t) + \text{state\_gate\_proj}(E_{k-1})\right)$$
+$$u_t = \sigma\!\left(\text{utility\_gate}(x_t) + \text{state\_gate\_proj}(\bar{E})\right)$$
 
-where $E_{k-1}$ is the mean energy per head from the previous forward pass's chunk states, upsampled from chunk-level to token-level. The gate modulates $V$ before injection: when $u_t \approx 0$, the existing state is preserved without update. An L1 penalty ($\lambda = 10^{-3}$) on $\mathbb{E}[u_t]$ encourages sparsity.
+where $\bar{E}$ is a per-head exponential moving average of state energy, updated each forward pass during training:
+
+$$\bar{E}_h \leftarrow \gamma_h \, \bar{E}_h + (1 - \gamma_h) \, \|h\|^2, \quad \gamma_h = \text{clamp}\!\left(1 - \tfrac{1}{\tau_h}, \; 0.9, \; 0.999\right)$$
+
+The EMA decay $\gamma_h$ is derived from each head's spectral initialization timescale $\tau_h$ — fast-decaying heads (short $\tau$) update their energy estimate quickly, while long-memory heads track energy over many steps. This provides a stable, per-head signal of current memory utilization without cross-batch leakage and without a manually tuned decay constant.
+
+The gate modulates $V$ before injection: when $u_t \approx 0$, the existing state is preserved without update. An L1 penalty $\lambda = 1 / \ln(V)^3$ (where $V$ is the vocabulary size) on $\mathbb{E}[u_t]$ encourages sparsity. The penalty is derived from the expected initial cross-entropy scale, providing gentle, scale-invariant pressure without manual tuning.
 
 ### 2.5 Layer-Stratified Spectral Initialization
 
@@ -86,6 +92,20 @@ $$h_t^{\text{true}} = h_t^{\text{local}} + \left(\prod_{s=0}^{t} \bar{A}_s\right
 
 Inter-chunk correction uses base $\bar{A}$ products (without delta erasure) — an acceptable approximation since most associations form and are erased within a single chunk of 64 steps. Total complexity is $O(L)$ time with $O(L/Q)$ sequential steps. Both the intra-chunk and inter-chunk scans use FP32 state accumulation with `@torch.compile` for JIT optimization.
 
+### 2.9 Parameter-Free Internal Constants
+
+All internal constants are derived from the minimal configuration surface — no magic numbers:
+
+| Internal Constant | Derivation | Replaces |
+|-------------------|------------|----------|
+| Gating range $c$ | $\ln(\text{context\_length})$ | Griffin's fixed $c = 8$ |
+| EMA decay $\gamma_h$ | $\text{clamp}(1 - 1/\tau_h, \; 0.9, \; 0.999)$ per head | Uniform $0.99$ |
+| Sparsity penalty $\lambda$ | $1 / \ln(\text{vocab\_size})^3$ | Fixed $10^{-3}$ |
+| SSM learning rate ratio | $1 / \sqrt{2 \cdot n_{\text{layers}}}$ | Fixed $0.1\times$ |
+| PPL display clamp | $\ln(\text{vocab\_size})$ | Fixed $20.0$ |
+
+Each derivation is grounded in a clear principle: gating range scales with sequence length (longer contexts need stronger flushing), EMA decay matches each head's characteristic timescale from spectral initialization, the sparsity penalty normalizes against the expected initial cross-entropy, and the SSM learning rate ratio follows T-Fixup depth scaling to preserve spectral initialization structure.
+
 ## 3. Architecture
 
 KSSM is a **homogeneous pure SSM**. The backbone is a stack of identical KSSM Blocks with pre-norm residual connections. There are no attention layers, MLP blocks, or hybrid components.
@@ -98,41 +118,43 @@ Each block applies the following operations in sequence:
 Input x: (B, L, d_model)
     |
     v
-[RMSNorm] ──> [in_proj] ──> split into z (gate), K (2D key), V (value)
-                                  |
-                                  v
-                          [Conv1dSiLU on V] ──> V_conv
-                                  |
-                                  v
-                 ┌────────────────┼────────────────┐
-                 |                |                 |
-         [dynamics_proj]   [selection_B/C/dt]  [utility_gate]
-          alpha, omega       K *= sel_B         u_t (sparse)
-                 |           Q *= sel_C              |
-                 v           dt += sel_dt            |
-         [AdaptiveTimestep]       |                  v
-              dt                  |          [state_gate_proj]
-                 |                |        (cached chunk feedback)
-                 v                |                  |
-         [recurrence_gate]        |                  v
-              r_t                 |        V_gated = V * vp_scale * u_t
-                 |                |                  |
-                 v                v                  v
-         [VP Scale Gated]   [beta_proj]     ┌───────┘
-              vp_scale          beta_t      |
-                 |                |         |
-                 v                v         v
-              ╔═══════════════════════════════╗
-              ║  SSD Chunkwise Parallel Scan  ║
-              ║  (Cayley + Delta Rule)        ║
-              ║  Returns: Y, chunk_states     ║
-              ╚═══════════════════════════════╝
+[RMSNorm] ──> [in_proj] ──> split into z (gate), x_gate, K (D-dim), V (2D)
+                                              |
+                                              v
+                                   [Conv1dSiLU on x_gate] ──> x_conv
+                                              |
+                                              v
+                 ┌────────────────────────────┼────────────────┐
+                 |                            |                 |
+         [dynamics_proj]              [selection_B/C/dt]  [utility_gate]
+          alpha, omega                  K *= sel_B         u_t (sparse)
+                 |                      Q *= sel_C              |
+                 v                      dt += sel_dt            |
+         [AdaptiveTimestep]                   |                 v
+              dt                              |        [state_gate_proj]
+                 |                            |         (EMA energy feedback)
+                 v                            |                 |
+         [recurrence_gate]                    |                 v
+              r_t                             |   V_gated = V * vp_scale * u_t
+                 |                            |                 |
+                 v                            v                 v
+         [VP Scale Gated]              [beta_proj]     ┌───────┘
+              vp_scale                    beta_t       |
+                 |                            |        |
+                 v                            v        v
+              ╔═══════════════════════════════════════════╗
+              ║    SSD Chunkwise Parallel Scan            ║
+              ║    K: (B,L,H,D), V: (B,L,H,2)           ║
+              ║    State h: (H, 2, D) matrix memory      ║
+              ║    Cayley + Delta Rule + r_gate on A_bar  ║
+              ║    Returns: Y (B,L,H,2,D), chunk_states  ║
+              ╚═══════════════════════════════════════════╝
                           |
                           v
-              [Q_proj readout] ──> y = (Q * Y).sum(-1)
+   [L2-norm Q] ──> readout: einsum(Y, Q) ──> (B,L,H,2) ──> [readout_proj]
                           |
                           v
-              [GroupNorm] ──> [z-gate (SiLU)] ──> [+ D skip]
+              [GroupNorm] ──> [z-gate (SiLU)] ──> [+ D skip (x_conv)]
                           |
                           v
                     [out_proj]
@@ -141,18 +163,21 @@ Input x: (B, L, d_model)
                   residual + output
 ```
 
+**Decoupled gate pathway:** The `x_gate` branch feeds the conv and all dynamics/selection/gate projections, while `K` (D-dimensional keys) and `V` (2D Hamiltonian values) are projected directly from `in_proj`. Keys and queries are L2-normalized for delta-rule training stability (per Gated DeltaNet ablations).
+
 ### Configuration
 
-Architecture dimensions are derived from two integers (`d_model`, `n_layers`) with no manual tuning:
+Architecture dimensions and all internal constants are derived from four integers with no manual tuning:
 
 | Parameter | Derivation | Default |
 |-----------|-----------|---------|
 | `d_model` | User-specified | 768 |
 | `n_layers` | User-specified | 12 |
+| `context_length` | Upper bound of spectral prior | 8192 |
+| `vocab_size` | Set from tokenizer | 50257 |
 | `d_inner` | `2 * d_model` | 1536 |
 | `head_dim` | Fixed at 64 (H100 Tensor Core alignment) | 64 |
 | `n_heads` | `d_inner / head_dim` | 24 |
-| `context_length` | Upper bound of spectral prior | 8192 |
 
 ### Parameter Count
 
@@ -171,7 +196,7 @@ kinetic-state-space-model/
 │   └── reproduce_results.sh      # Deterministic reproduction
 └── src/kssm/
     ├── config/
-    │   └── defaults.py           # KSSMConfig dataclass, METABOLIC_LAMBDA
+    │   └── defaults.py           # KSSMConfig dataclass, derived constant functions
     ├── data/
     │   └── datasets.py           # WikiText-103 with GPT-2 tokenizer
     ├── models/
@@ -238,12 +263,12 @@ Default configuration (`configs/default.yaml`):
 | Context length | 1024 |
 | Batch size | 4 (x8 gradient accumulation = 32 effective) |
 | Optimizer | AdamW ($\beta_1=0.9$, $\beta_2=0.95$, wd=0.1, fused) |
-| Base LR | $6 \times 10^{-4}$ (SSM params at $0.1\times$) |
+| Base LR | $6 \times 10^{-4}$ (SSM params at $1/\sqrt{2 \cdot n_{\text{layers}}} \approx 0.2\times$) |
 | Schedule | Cosine decay with 500-step linear warmup |
 | Precision | bfloat16 |
 | Epochs | 20 |
 
-The SSM parameter group (dynamics projections, gates, selection layers) receives $0.1\times$ the base learning rate to preserve spectral initialization structure during early training.
+The SSM parameter group (dynamics projections, gates, selection layers) receives a reduced learning rate derived from model depth: $\text{lr}_{\text{SSM}} = \text{lr}_{\text{base}} / \sqrt{2 \cdot n_{\text{layers}}}$ (T-Fixup aligned). This preserves spectral initialization structure during early training and scales naturally with depth.
 
 ### Reproduction
 
@@ -263,13 +288,33 @@ Deterministic seeding covers Python, NumPy, PyTorch, CUDA, and data loader worke
 
 4. **Layer-Stratified Spectral Priors.** Depth-dependent frequency band initialization assigns short timescales to early layers and long timescales to deep layers, with 50% overlap between adjacent bands. Combined with adaptive timestep normalization, this provides scale-invariant dynamics across the full timescale range.
 
-## 8. References
+## 8. Known Limitations
+
+### Readout Capacity Bottleneck
+
+Each head maintains a 2×D matrix memory, but readout retrieves a **2-vector per head** via $\text{einsum}(Y, Q) \in \mathbb{R}^{H \times 2}$. With the default configuration ($H = 24$), this produces a 48-dimensional vector that `readout_proj` expands to $d_{\text{inner}} = 1536$. The maximum rank of this projection is 48 — roughly **3% of the per-token expressivity** of standard multi-head attention, which produces $H \times d_{\text{head}} = 24 \times 64 = 1536$ values directly.
+
+The model compensates through temporal integration: the matrix memory accumulates information over many timesteps, so the effective capacity is much larger than a single readout step suggests. However, for tasks requiring high single-step information throughput (e.g., large lookup tables), this bottleneck may be limiting.
+
+**Potential mitigation:** Increase the Hamiltonian state dimension from 2 to a configurable `d_state` (e.g., 8 or 16). This would change $\bar{A}$ from $2 \times 2$ to $d_{\text{state}} \times d_{\text{state}}$, requiring block-diagonal or structured parameterization to maintain efficient Cayley discretization. The readout would then produce $H \times d_{\text{state}}$ values per token, directly reducing the bottleneck.
+
+### Sequential Intra-Chunk Scan
+
+The intra-chunk delta-rule scan (`_intra_chunk_scan_delta`) uses a sequential Python loop over $C = 64$ timesteps per chunk. While `@torch.compile` enables JIT fusion and eliminates Python overhead, it cannot parallelize the inherent sequential dependency of the delta-rule recurrence:
+
+$$h_t = \bar{A}_t \left( h_{t-1} - \beta_t (k_t^\top h_{t-1}) k_t \right) + \beta_t \, v_t k_t^\top \Delta t_t$$
+
+Each step depends on $h_{t-1}$, preventing within-chunk parallelism. SOTA implementations of linear attention with delta rule (Gated DeltaNet) use the **WY/UT decomposition** to reformulate the sequential scan as a series of matrix multiplications amenable to GPU tensor cores, or employ custom **Triton kernels** for hardware-parallel execution.
+
+This is a **throughput limitation**, not a correctness issue. The inter-chunk recurrence ($O(L/Q)$ sequential steps) and broadcast correction are already efficient. Replacing the intra-chunk loop with a WY-decomposition or Triton kernel would be the primary optimization for training speed at scale.
+
+## 9. References
 
 | Paper | Relationship to KSSM |
 |-------|---------------------|
 | Dao & Gu (2024). [Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State Space Duality](https://arxiv.org/abs/2405.21060). | **SSD chunkwise parallel scan.** KSSM adapts the Mamba-2 chunk-level scan for 2x2 block matrices with Cayley discretization. The intra-chunk/inter-chunk/correction decomposition is preserved; the scan kernel is replaced with a sequential delta-rule recurrence. |
 | Yang et al. (2024). [Gated Delta Networks: Improving Mamba-2 with Delta Rule](https://arxiv.org/abs/2412.06464). | **Delta-rule state update.** KSSM integrates the gated delta rule ($h \leftarrow A(h - \beta k k^\top h) + \beta v k^\top$) into the Cayley recurrence, enabling selective association erasure within A-stable dynamics. |
-| De et al. (2024). [Griffin: Mixing Gated Linear Recurrences with Local Attention for Efficient Language Models](https://arxiv.org/abs/2402.19427). | **Learned recurrence gate + variance-preserving scale.** The RG-LRU mechanism ($|\lambda_{\text{eff}}| = |\lambda|^{c \cdot r_t}$, $c=8$) provides learned retention control. KSSM derives the base eigenvalue from Cayley discretization rather than a diagonal parameterization. |
+| De et al. (2024). [Griffin: Mixing Gated Linear Recurrences with Local Attention for Efficient Language Models](https://arxiv.org/abs/2402.19427). | **Learned recurrence gate + variance-preserving scale.** The RG-LRU mechanism ($|\lambda_{\text{eff}}| = |\lambda|^{c \cdot r_t}$) provides learned retention control. KSSM derives both the base eigenvalue from Cayley discretization and the gating range $c = \ln(T)$ from context length, replacing Griffin's fixed $c = 8$. |
 | Boominathan et al. (2025). [Attention When You Need](https://arxiv.org/abs/2501.07440). | **Utility gating.** The metabolic gate concept — suppressing state updates when input is irrelevant — motivates KSSM's state-conditioned utility gate with L1 sparsity regularization. |
 | Gu et al. (2022). [Efficiently Modeling Long Sequences with Structured State Spaces](https://arxiv.org/abs/2111.00396). | **Structured state spaces foundation.** S4 established the HiPPO initialization and parallel scan framework. KSSM replaces diagonal/NPLR structure with 2x2 Hamiltonian blocks and replaces HiPPO with layer-stratified spectral priors. |
 | Chen et al. (2020). [Symplectic Recurrent Neural Networks](https://arxiv.org/abs/1909.13334). | **Hamiltonian structure in recurrence.** SymRNN demonstrated that Hamiltonian priors improve long-term gradient flow. KSSM extends this with dissipation ($\alpha > 0$), Cayley discretization (replacing leapfrog), and integration into the SSD parallel scan. |

@@ -25,27 +25,8 @@ def bf16_safety_constants(dtype: torch.dtype) -> tuple[float, float, float]:
     return omega_thresh, delta, smoothness
 
 
-def dynamics_scale(n_layers: int) -> float:
-    """Derive dynamics projection dampening from depth (1/sqrt(n_layers))."""
-    return 1.0 / math.sqrt(n_layers)
-
 
 # Variance-Preserving Scale (Griffin RG-LRU style)
-
-def compute_variance_preserving_scale(
-    alpha: Tensor,
-    omega: Tensor,
-    dt: Tensor,
-    eps: float = 1e-6,
-) -> Tensor:
-    """Compute variance-preserving input scale: sqrt(1 - |eigenvalue(A_bar)|^2)."""
-    tau = dt * 0.5
-    tau_alpha = tau * alpha
-    tau_omega = tau * omega
-    denom = (1.0 + tau_alpha).square() + tau_omega.square()
-    scale = torch.sqrt(4.0 * tau_alpha / (denom + eps))
-    return scale.clamp(max=1.0)
-
 
 def compute_variance_preserving_scale_gated(
     alpha: Tensor,
@@ -102,7 +83,7 @@ def compute_variance_preserving_std(
     layer_scale = 1.0 / math.sqrt(2 * n_layers)
 
     # Dynamics projection dampening: derived from depth
-    dyn_scale = dynamics_scale(n_layers)
+    dyn_scale = 1.0 / math.sqrt(n_layers)
 
     return {
         "embedding": math.sqrt(1.0 / d_model),
@@ -195,13 +176,16 @@ def apply_spectral_init(
     layer_idx: int,
     n_layers: int,
     context_length: int = 8192,
-) -> None:
+) -> Tensor:
     """Apply layer-stratified log-spaced spectral initialization.
 
     Early layers receive high-frequency (short timescale) priors for local
     pattern matching. Deep layers receive low-frequency (long timescale)
     priors for document-level coherence. Each layer covers an overlapping
     50% band of the total log-timescale range, sliding with depth.
+
+    Returns:
+        tau: (n_heads,) per-head timescales for EMA decay derivation.
     """
     # Universal Bounds
     t_min = 1.0
@@ -243,7 +227,8 @@ def apply_spectral_init(
         h = n_heads
         block.dynamics_proj.bias[:h].copy_(alpha_biases)
         block.dynamics_proj.bias[h:2*h].copy_(omega_init)
-        block.dynamics_proj.bias[2*h:3*h].zero_()
+
+    return tau
 
 
 # RMSNorm - Root Mean Square Layer Normalization

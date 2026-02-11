@@ -3,7 +3,7 @@
 import torch.nn as nn
 from torch import Tensor
 
-from kssm.config.defaults import KSSMConfig, METABOLIC_LAMBDA
+from kssm.config.defaults import KSSMConfig, derived_metabolic_lambda
 from .kssm_block import KSSMBlock
 from .components import RMSNorm
 
@@ -44,16 +44,16 @@ class KSSMBackbone(nn.Module):
 
     def get_metabolic_loss(self) -> Tensor:
         """Aggregate auxiliary utility loss from all blocks.
-        
-        This applies the standardized sparsity penalty (METABOLIC_LAMBDA)
-        to the mean gate activation.
+
+        Sparsity penalty λ = 1/log(vocab_size)³ is derived from vocab size,
+        providing scale-invariant pressure independent of dataset or model size.
 
         Returns:
-            Scalar tensor: Standardized auxiliary loss to be added to the task loss.
+            Scalar tensor: Derived auxiliary loss to be added to the task loss.
         """
         total_loss = 0.0
         for block in self.blocks:
-            if hasattr(block, "_metabolic_loss"):
-                total_loss += block._metabolic_loss
-        
-        return (total_loss / len(self.blocks)) * METABOLIC_LAMBDA
+            total_loss += block._metabolic_loss
+
+        lam = derived_metabolic_lambda(self.config.vocab_size)
+        return (total_loss / len(self.blocks)) * lam
