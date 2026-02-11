@@ -47,6 +47,44 @@ def compute_variance_preserving_scale(
     return scale.clamp(max=1.0)
 
 
+def compute_variance_preserving_scale_gated(
+    alpha: Tensor,
+    omega: Tensor,
+    dt: Tensor,
+    r_gate: Tensor,
+    c: float = 8.0,
+    eps: float = 1e-6,
+) -> Tensor:
+    """Compute learnable VP scale with Griffin RG-LRU-style recurrence gate.
+
+    The learned gate r_t modulates the effective eigenvalue decay via
+    exponentiation: effective_eig = eig^(c * r_t). When r_t -> 0, the
+    effective decay is minimal (state held). When r_t -> 1, the decay
+    is amplified (state flushed). This gives the model control over
+    retention independent of the Hamiltonian dynamics.
+
+    Args:
+        alpha, omega, dt: (B, L, H) dynamics parameters
+        r_gate: (B, L, H) learned recurrence gate in [0, 1]
+        c: gating range constant (default 8.0, matching Griffin)
+        eps: numerical stability constant
+    """
+    tau = dt * 0.5
+    tau_alpha = tau * alpha
+    tau_omega = tau * omega
+
+    # |eigenvalue(A_bar)|^2 = ((1-tau*alpha)^2 + (tau*omega)^2) / ((1+tau*alpha)^2 + (tau*omega)^2)
+    numer = (1.0 - tau_alpha).square() + tau_omega.square()
+    denom = (1.0 + tau_alpha).square() + tau_omega.square()
+    eig_sq = numer / (denom + eps)
+
+    # Modulate decay via learned gate
+    effective_eig_sq = eig_sq.pow(c * r_gate)
+
+    scale = torch.sqrt((1.0 - effective_eig_sq).clamp(min=eps))
+    return scale.clamp(max=1.0)
+
+
 # Variance-Preserving Initialization (T-Fixup style)
 
 def compute_variance_preserving_std(
@@ -158,20 +196,30 @@ def apply_spectral_init(
     n_layers: int,
     context_length: int = 8192,
 ) -> None:
-    """Apply log-spaced spectral initialization using Universal Priors."""
+    """Apply layer-stratified log-spaced spectral initialization.
+
+    Early layers receive high-frequency (short timescale) priors for local
+    pattern matching. Deep layers receive low-frequency (long timescale)
+    priors for document-level coherence. Each layer covers an overlapping
+    50% band of the total log-timescale range, sliding with depth.
+    """
     # Universal Bounds
     t_min = 1.0
     t_max = float(context_length)
-    freq_max = 0.5
-    freq_min = 1.0 / t_max
-    
+
+    log_t_min = math.log(t_min)
+    log_t_max = math.log(t_max)
+    log_range = log_t_max - log_t_min
+
+    # Layer-dependent band: slides from short to long timescales with depth
+    layer_frac = layer_idx / max(n_layers - 1, 1)  # 0.0 to 1.0
+    band_width = 0.5 * log_range  # each layer sees 50% of full range
+    band_start = log_t_min + layer_frac * (log_range - band_width)
+    band_end = band_start + band_width
+
     with torch.no_grad():
-        # Log-spaced timescales for multi-scale memory
-        log_tau = torch.linspace(
-            math.log(t_min),
-            math.log(t_max),
-            n_heads,
-        )
+        # Log-spaced timescales within this layer's band
+        log_tau = torch.linspace(band_start, band_end, n_heads)
         tau = torch.exp(log_tau)
 
         # Alpha = 1/tau (damping rate inversely proportional to timescale)
@@ -181,10 +229,12 @@ def apply_spectral_init(
         # x = log(exp(alpha) - 1)
         alpha_biases = torch.log(torch.exp(alpha_init) - 1 + 1e-6)
 
-        # Log-spaced frequencies
+        # Frequencies inversely track timescales within the band
+        freq_min_layer = 1.0 / math.exp(band_end)
+        freq_max_layer = min(0.5, 1.0 / math.exp(band_start))
         log_freqs = torch.linspace(
-            math.log(freq_min),
-            math.log(freq_max),
+            math.log(max(freq_min_layer, 1e-8)),
+            math.log(freq_max_layer),
             n_heads,
         )
         omega_init = torch.exp(log_freqs)

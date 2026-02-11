@@ -10,21 +10,27 @@ from .components import (
     AdaptiveTimestep,
     Conv1dSiLU,
     compute_variance_preserving_std,
-    compute_variance_preserving_scale,
+    compute_variance_preserving_scale_gated,
     apply_spectral_init,
     RMSNorm,
 )
 
 
 class KSSMBlock(nn.Module):
-    """SC-KSSM block with adaptive timestep, convolution, and gates.
+    """Cayley-stable dissipative Hamiltonian SSM block.
 
-    Uses:
-    - AdaptiveTimestep: dt = c/(alpha + |omega|)
-    - Conv1dSiLU: Fused CUDA kernel (kernel_size=4)
-    - Utility Gating: Sparse attention via metabolic cost
-    - Variance-preserving gating (Griffin RG-LRU)
-    - Phase Modulation Encoding: omega_mod for PME
+    The state matrix A = [[-alpha, omega], [-omega, -alpha]] with alpha >= 0
+    is discretized via the Cayley transform, guaranteeing |eigenvalue(A_bar)| <= 1
+    unconditionally (A-stability). With alpha > 0 the dynamics are dissipative
+    (not exactly symplectic), providing controllable decay alongside rotation.
+
+    Components:
+    - AdaptiveTimestep: dt = c/(alpha + |omega|) for scale-invariant dynamics
+    - Conv1dSiLU: Fused CUDA depthwise conv1d + SiLU (kernel_size=4)
+    - Delta-rule state update with selective erasure via beta gate
+    - Learned recurrence gate (Griffin RG-LRU style) for variance-preserving gating
+    - Utility gating with state-conditioned feedback for metabolic sparsity
+    - Position encoding via omega modulation (RoPE-like)
     """
 
     def __init__(self, config: KSSMConfig, layer_idx: int = 0):
@@ -60,11 +66,23 @@ class KSSMBlock(nn.Module):
         # SSD Scanner (Mamba-2 algorithm)
         self.ssd_scan = SSDChunkwiseScan(self.d_inner, self.n_heads)
 
-        # Utility Gating
+        # Utility Gating (state-conditioned)
         # Predicts "Utility" of current input for the memory
         # Low utility -> Low attention (gate ~ 0) -> "Coasting"
         self.utility_gate = nn.Linear(self.d_inner, self.n_heads, bias=True)
-        self._metabolic_loss = 0.0 # Store for external access
+        self.state_gate_proj = nn.Linear(self.n_heads, self.n_heads, bias=False)
+        self._metabolic_loss = 0.0  # Store for external access
+        self._cached_chunk_states = None  # Cached from previous forward pass
+
+        # Delta-rule update gate (beta)
+        self.beta_proj = nn.Linear(self.d_inner, self.n_heads, bias=True)
+
+        # Learned recurrence gate (Griffin RG-LRU style)
+        self.recurrence_gate = nn.Linear(self.d_inner, self.n_heads, bias=True)
+
+        # Position encoding frequencies (RoPE-like, not learned)
+        freqs = 1.0 / (10000 ** (torch.arange(0, self.n_heads, dtype=torch.float32) / self.n_heads))
+        self.register_buffer("rope_freqs", freqs, persistent=False)
 
         # Input-dependent selection (Mamba-style)
         self.selection_B = nn.Linear(self.d_inner, self.n_heads * 2, bias=False)
@@ -122,10 +140,21 @@ class KSSMBlock(nn.Module):
         nn.init.normal_(self.selection_C.weight, std=selection_std)
         nn.init.normal_(self.selection_dt.weight, std=selection_std)
 
+        # Beta gate: sigmoid(0) = 0.5 (moderate delta-rule update strength)
+        nn.init.normal_(self.beta_proj.weight, std=selection_std)
+        nn.init.zeros_(self.beta_proj.bias)
+
+        # Recurrence gate: bias=1.0 so sigmoid(1)~0.73 (moderate decay, mostly open)
+        nn.init.normal_(self.recurrence_gate.weight, std=selection_std)
+        nn.init.constant_(self.recurrence_gate.bias, 1.0)
+
         # Utility Gate: Initialize to slightly closed (lazy) state
         # Bias = -1.0 => sigmoid(-1.0) ~= 0.27 (starting with low attention)
         nn.init.normal_(self.utility_gate.weight, std=selection_std)
         nn.init.constant_(self.utility_gate.bias, -1.0)
+
+        # State gate: small init so state feedback starts weak
+        nn.init.normal_(self.state_gate_proj.weight, std=0.01)
 
         # Q_proj: identity-like readout (both h0 and h1 dimensions)
         nn.init.zeros_(self.Q_proj.weight)
@@ -176,6 +205,10 @@ class KSSMBlock(nn.Module):
         omega_mod = dynamics[..., 2*h:3*h]
         omega = omega_base + omega_mod
 
+        # Position encoding via omega modulation (RoPE-like)
+        positions = torch.arange(seq_len, device=x.device, dtype=omega.dtype).unsqueeze(0).unsqueeze(-1)
+        omega = omega + positions * self.rope_freqs
+
         # Adaptive timestep
         dt = self.adaptive_dt(alpha_base, omega)
 
@@ -199,9 +232,12 @@ class KSSMBlock(nn.Module):
         # Dynamics: Alpha is purely predicted by dynamics_proj
         alpha = alpha_base
 
-        # Variance-preserving gating (Griffin RG-LRU style)
-        # Scale input injection by sqrt(1 - |eigenvalue(A_bar)|^2)
-        vp_scale = compute_variance_preserving_scale(alpha, omega, dt)
+        # Learned recurrence gate (Griffin RG-LRU style)
+        r_gate = torch.sigmoid(self.recurrence_gate(V_for_dynamics_proj))  # (B, L, H)
+
+        # Variance-preserving gating with learned recurrence gate
+        # Scale input injection by sqrt(1 - |effective_eigenvalue|^2)
+        vp_scale = compute_variance_preserving_scale_gated(alpha, omega, dt, r_gate)
         vp_scale_expanded = vp_scale.unsqueeze(-1).expand(
             -1, -1, -1, self.head_dim
         ).reshape(batch, seq_len, self.d_inner).unsqueeze(-1)
@@ -209,10 +245,23 @@ class KSSMBlock(nn.Module):
         # Base V_gated is just the convolved V
         V_gated = V_conv * vp_scale_expanded
 
-        # Utility Gating
+        # State-conditioned utility gating
         # u_gate: (B, L, H) in [0, 1]
-        u_gate = torch.sigmoid(self.utility_gate(V_for_dynamics_proj))
-        
+        u_logit = self.utility_gate(V_for_dynamics_proj)  # (B, L, H)
+
+        # Add state feedback from previous forward pass (if available)
+        if self._cached_chunk_states is not None:
+            # Reduce (B, NC, H, D, 2) -> (B, NC, H) via mean energy per head
+            state_energy = self._cached_chunk_states.pow(2).sum(-1).mean(-1)
+            state_signal = self.state_gate_proj(state_energy)  # (B, NC, H)
+            # Upsample from chunk-level to token-level
+            state_signal = state_signal.repeat_interleave(
+                self.ssd_scan.chunk_size, dim=1
+            )[:, :seq_len]  # (B, L, H)
+            u_logit = u_logit + state_signal
+
+        u_gate = torch.sigmoid(u_logit)
+
         # Store mean activation for loss computation (L1 sparsity)
         self._metabolic_loss = u_gate.mean()
 
@@ -230,12 +279,18 @@ class KSSMBlock(nn.Module):
         # Apply input-dependent C selection to Q
         Q = Q * sel_C
 
+        # Delta-rule update gate
+        beta = torch.sigmoid(self.beta_proj(V_for_dynamics_proj))  # (B, L, H)
+
         # Evolution via Cayley discretization (Chunkwise Parallel Scan)
         # Reshape from flat (B,L,d_inner,X) to per-head (B,L,H,D,X) for SSD
         K_heads = K.view(batch, seq_len, self.n_heads, self.head_dim, 2)
         V_gated_heads = V_gated.view(batch, seq_len, self.n_heads, self.head_dim, 1)
 
-        Y = self.ssd_scan(alpha, omega, dt, K_heads, V_gated_heads)
+        Y, chunk_states = self.ssd_scan(alpha, omega, dt, K_heads, V_gated_heads, beta=beta)
+
+        # Cache chunk states for state-conditioned gating in next forward pass
+        self._cached_chunk_states = chunk_states.detach()
 
         # Reshape SSD output (B, L, H, D, 2) back to (B, L, d_inner, 2) for Q readout
         Y = Y.reshape(batch, seq_len, self.d_inner, 2)
