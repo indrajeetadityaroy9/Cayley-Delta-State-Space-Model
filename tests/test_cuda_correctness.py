@@ -13,9 +13,7 @@ import torch
 import torch.nn.functional as F
 
 
-# ============================================================================
 # Python Reference Implementations
-# ============================================================================
 
 def ref_cayley_discretize(alpha, omega, dt, eps=1e-6):
     """Python reference for Cayley discretization (matches cayley_math.cuh)."""
@@ -189,9 +187,7 @@ def ref_inter_chunk_scan(total_A, final_local_h):
     return chunk_states.to(dtype)
 
 
-# ============================================================================
 # Tests
-# ============================================================================
 
 @pytest.fixture(scope="module")
 def device():
@@ -203,7 +199,7 @@ class TestCayleyVP:
     """Test cayley_vp_cuda against Python reference."""
 
     def test_forward_with_gate(self, device):
-        from kssm.ops import cayley_vp_cuda
+        from cdssm.ops import cayley_vp_cuda
 
         B, L, H = 2, 256, 6
         torch.manual_seed(42)
@@ -229,7 +225,7 @@ class TestCayleyVP:
             f"vp_scale mismatch: max diff = {(vp_cuda - vp_ref).abs().max():.6f}"
 
     def test_forward_without_gate(self, device):
-        from kssm.ops import cayley_vp_cuda
+        from cdssm.ops import cayley_vp_cuda
 
         B, L, H = 2, 128, 6
         torch.manual_seed(123)
@@ -255,7 +251,7 @@ class TestAdaptiveDt:
     """Test adaptive_dt_cuda against Python reference."""
 
     def test_forward(self, device):
-        from kssm.ops import adaptive_dt_cuda
+        from cdssm.ops import adaptive_dt_cuda
 
         B, L, H = 2, 256, 6
         torch.manual_seed(42)
@@ -288,7 +284,7 @@ class TestIntraChunkScan:
     """Test intra_chunk_scan_cuda against Python reference."""
 
     def test_forward(self, device):
-        from kssm.ops import intra_chunk_scan_cuda
+        from cdssm.ops import intra_chunk_scan_cuda
 
         # Use smaller shapes to keep the Python reference tractable
         BNC, C, H, D = 4, 16, 4, 32
@@ -307,7 +303,7 @@ class TestIntraChunkScan:
         A_flat[..., 1, 1] = cos_t.bfloat16()
 
         K_flat = torch.randn(BNC, C, H, D, device=device, dtype=torch.bfloat16) * 0.1
-        # Normalize keys (matching kssm_block.py)
+        # Normalize keys (matching block.py)
         K_flat = F.normalize(K_flat.float(), dim=-1).bfloat16()
         V_flat = torch.randn(BNC, C, H, 2, device=device, dtype=torch.bfloat16) * 0.1
         beta_flat = torch.sigmoid(torch.randn(BNC, C, H, device=device, dtype=torch.bfloat16))
@@ -329,7 +325,7 @@ class TestInterChunkScan:
     """Test inter_chunk_scan_cuda against Python reference."""
 
     def test_forward(self, device):
-        from kssm.ops import inter_chunk_scan_cuda
+        from cdssm.ops import inter_chunk_scan_cuda
 
         B, NC, H, D = 2, 8, 6, 64
         torch.manual_seed(42)
@@ -363,7 +359,7 @@ class TestEndToEndScan:
 
     def test_ssd_pipeline(self, device):
         """Test that intra + inter + correction matches a flat sequential scan."""
-        from kssm.ops import intra_chunk_scan_cuda, inter_chunk_scan_cuda
+        from cdssm.ops import intra_chunk_scan_cuda, inter_chunk_scan_cuda
 
         B, L, H, D = 1, 128, 2, 32
         C = 64

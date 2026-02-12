@@ -1,8 +1,8 @@
-KSSM Throughput Optimization Plan: SOTA-Competitive Block                                                                                                                                                      
+CDSSM Throughput Optimization Plan: SOTA-Competitive Block                                                                                                                                                      
    
      Context                                                                                                                                                                                                        
                                                                                                                                                                                                                   
-     Profiling the CUDA-migrated KSSM block (B=4, L=1024, d_model=384, H100) revealed the fused CUDA kernels account for only 15% of CUDA time. The actual bottlenecks are:
+     Profiling the CUDA-migrated CDSSM block (B=4, L=1024, d_model=384, H100) revealed the fused CUDA kernels account for only 15% of CUDA time. The actual bottlenecks are:
 
      - 39%: Unfused elementwise PyTorch ops (~600 separate kernel launches for sigmoid, softplus, normalize, multiply, add, etc.)
      - 35%: GEMM from 12 nn.Linear projections per block (vs 3-4 in Mamba-2/GatedDeltaNet)
@@ -64,9 +64,9 @@ KSSM Throughput Optimization Plan: SOTA-Competitive Block
 
      Files changed
 
-     - src/kssm/models/kssm_block.py: Replace 7 nn.Linear with gate_proj; update _init_weights(); update forward() to split gate_proj output and apply activations
-     - src/kssm/models/components.py: apply_spectral_init references change from block.dynamics_proj.bias → block.gate_proj.bias
-     - src/kssm/training/optim.py: Update ssm_keywords list — replace individual names with "gate_proj", keep "log_dt_scale"
+     - src/models/cdssm_block.py: Replace 7 nn.Linear with gate_proj; update _init_weights(); update forward() to split gate_proj output and apply activations
+     - src/models/components.py: apply_spectral_init references change from block.dynamics_proj.bias → block.gate_proj.bias
+     - src/training/optim.py: Update ssm_keywords list — replace individual names with "gate_proj", keep "log_dt_scale"
 
      ---
      Phase 2: Remove Utility Gating
@@ -75,22 +75,22 @@ KSSM Throughput Optimization Plan: SOTA-Competitive Block
 
      Changes
 
-     - kssm_block.py:
+     - cdssm_block.py:
        - Remove: state_gate_proj, _metabolic_loss, _ema_energy, _ema_decay buffer
        - Remove from forward(): state_signal computation (line 237), u_logit (238), u_gate sigmoid (240), metabolic_loss store (243), EMA update (268-271)
        - Simplify: V_gated = V * vp_scale.unsqueeze(-1) (remove * u_gate)
        - Move log_dt_scale from AdaptiveTimestep module to direct nn.Parameter on block (since AdaptiveTimestep is absorbed in Phase 3)
        - Move safety constants (_omega_thresh, _delta, _smoothness, _eps) from AdaptiveTimestep to block buffers
-     - src/kssm/models/backbone.py: get_metabolic_loss() → returns torch.tensor(0.0)
-     - src/kssm/training/trainer.py: Remove metabolic_loss from print statement (line 53); loss computation (lines 32-33) becomes just loss = task_loss (metabolic returns 0)
-     - src/kssm/training/optim.py: Remove "utility_gate", "state_gate_proj" from ssm_keywords
+     - src/models/backbone.py: get_metabolic_loss() → returns torch.tensor(0.0)
+     - src/training/trainer.py: Remove metabolic_loss from print statement (line 53); loss computation (lines 32-33) becomes just loss = task_loss (metabolic returns 0)
+     - src/training/optim.py: Remove "utility_gate", "state_gate_proj" from ssm_keywords
 
      ---
      Phase 3: Fused Dynamics Kernel (CUDA)
 
      Replace adaptive_dt.cu + cayley_vp.cu + ~15 elementwise PyTorch ops with a single dynamics_fused.cu kernel. This is the highest-impact optimization (eliminates the 39% elementwise overhead).
 
-     New kernel: src/kssm/csrc/kernels/dynamics_fused.cu
+     New kernel: cdssm/csrc/kernels/dynamics_fused.cu
 
      Grid: (B, cdiv(L, 256), H), Block: 256 threads. Each thread processes one (b, l, h) position — pure elementwise, no cross-thread dependency.
 
@@ -140,9 +140,9 @@ KSSM Throughput Optimization Plan: SOTA-Competitive Block
 
      Integration files
 
-     - src/kssm/csrc/binding.cpp: Add dynamics_fused_fwd_cuda, dynamics_fused_bwd_cuda
-     - src/kssm/ops/__init__.py: Add DynamicsFusedFn(Function) + dynamics_fused_cuda() convenience function
-     - src/kssm/models/kssm_block.py: Replace the elementwise chain (lines 202-262) with single dynamics_fused_cuda() call
+     - cdssm/csrc/binding.cpp: Add dynamics_fused_fwd_cuda, dynamics_fused_bwd_cuda
+     - src/ops/__init__.py: Add DynamicsFusedFn(Function) + dynamics_fused_cuda() convenience function
+     - src/models/cdssm_block.py: Replace the elementwise chain (lines 202-262) with single dynamics_fused_cuda() call
      - Keep adaptive_dt.cu and cayley_vp.cu for reference/standalone testing
 
      ---
@@ -156,7 +156,7 @@ KSSM Throughput Optimization Plan: SOTA-Competitive Block
 
      Since sel_B is a per-head scalar and normalize divides by L2 norm, the scalar magnitude cancels. Only its sign survives.
 
-     New kernel: src/kssm/csrc/kernels/normalize_kq.cu
+     New kernel: cdssm/csrc/kernels/normalize_kq.cu
 
      Grid: (B*L, H), Block: D threads (64). Requires cross-thread reduction (sum of squares over D dimensions) — same block_reduce_to_scalar pattern as intra_chunk_scan.cu.
 
@@ -169,9 +169,9 @@ KSSM Throughput Optimization Plan: SOTA-Competitive Block
 
      Integration
 
-     - src/kssm/csrc/binding.cpp: Add normalize_kq_fwd_cuda, normalize_kq_bwd_cuda
-     - src/kssm/ops/__init__.py: Add NormalizeKQFn(Function) + normalize_kq_cuda()
-     - src/kssm/models/kssm_block.py: Replace K = F.normalize(K * sel_B, dim=-1) and Q = F.normalize(Q * sel_C, dim=-1) with K, Q = normalize_kq_cuda(K_raw, Q_raw, sel_B_sign, sel_C_sign)
+     - cdssm/csrc/binding.cpp: Add normalize_kq_fwd_cuda, normalize_kq_bwd_cuda
+     - src/ops/__init__.py: Add NormalizeKQFn(Function) + normalize_kq_cuda()
+     - src/models/cdssm_block.py: Replace K = F.normalize(K * sel_B, dim=-1) and Q = F.normalize(Q * sel_C, dim=-1) with K, Q = normalize_kq_cuda(K_raw, Q_raw, sel_B_sign, sel_C_sign)
 
      ---
      Optimized Forward Pass
@@ -221,23 +221,23 @@ KSSM Throughput Optimization Plan: SOTA-Competitive Block
      ┌────────┬─────────────────────────────────────────┬─────────┐
      │ Action │                  File                   │  Phase  │
      ├────────┼─────────────────────────────────────────┼─────────┤
-     │ Edit   │ src/kssm/models/kssm_block.py           │ 1,2,3,4 │
+     │ Edit   │ src/models/cdssm_block.py           │ 1,2,3,4 │
      ├────────┼─────────────────────────────────────────┼─────────┤
-     │ Edit   │ src/kssm/models/components.py           │ 1,2     │
+     │ Edit   │ src/models/components.py           │ 1,2     │
      ├────────┼─────────────────────────────────────────┼─────────┤
-     │ Edit   │ src/kssm/models/backbone.py             │ 2       │
+     │ Edit   │ src/models/backbone.py             │ 2       │
      ├────────┼─────────────────────────────────────────┼─────────┤
-     │ Edit   │ src/kssm/training/trainer.py            │ 2       │
+     │ Edit   │ src/training/trainer.py            │ 2       │
      ├────────┼─────────────────────────────────────────┼─────────┤
-     │ Edit   │ src/kssm/training/optim.py              │ 1,2     │
+     │ Edit   │ src/training/optim.py              │ 1,2     │
      ├────────┼─────────────────────────────────────────┼─────────┤
-     │ Create │ src/kssm/csrc/kernels/dynamics_fused.cu │ 3       │
+     │ Create │ cdssm/csrc/kernels/dynamics_fused.cu │ 3       │
      ├────────┼─────────────────────────────────────────┼─────────┤
-     │ Create │ src/kssm/csrc/kernels/normalize_kq.cu   │ 4       │
+     │ Create │ cdssm/csrc/kernels/normalize_kq.cu   │ 4       │
      ├────────┼─────────────────────────────────────────┼─────────┤
-     │ Edit   │ src/kssm/csrc/binding.cpp               │ 3,4     │
+     │ Edit   │ cdssm/csrc/binding.cpp               │ 3,4     │
      ├────────┼─────────────────────────────────────────┼─────────┤
-     │ Edit   │ src/kssm/ops/__init__.py                │ 3,4     │
+     │ Edit   │ src/ops/__init__.py                │ 3,4     │
      └────────┴─────────────────────────────────────────┴─────────┘
      Not touched: adaptive_dt.cu, cayley_vp.cu, intra_chunk_scan.cu, inter_chunk_scan.cu, conv1d_silu.cu, cayley_math.cuh, common.cuh, reduction.cuh, setup.py
 
@@ -266,10 +266,10 @@ KSSM Throughput Optimization Plan: SOTA-Competitive Block
      # Record baseline throughput
      python -c "
      import torch, time
-     from kssm.config.defaults import KSSMConfig
-     from kssm.models.kssm_block import KSSMBlock
-     config = KSSMConfig(d_model=384, n_layers=12, context_length=8192)
-     block = KSSMBlock(config, layer_idx=0).cuda().bfloat16()
+     from cdssm.config.defaults import CDSSMConfig
+     from cdssm.models.cdssm_block import CDSSMBlock
+     config = CDSSMConfig(d_model=384, n_layers=12, context_length=8192)
+     block = CDSSMBlock(config, layer_idx=0).cuda().bfloat16()
      x = torch.randn(4, 1024, 384, device='cuda', dtype=torch.bfloat16)
      # warmup
      for _ in range(10): block(x)
@@ -284,7 +284,7 @@ KSSM Throughput Optimization Plan: SOTA-Competitive Block
      "
 
      # Record baseline WikiText val PPL (1 epoch, small config for speed)
-     python scripts/train.py --config configs/default.yaml --seed 42
+     python -m cdssm.train --config configs/default.yaml --seed 42
      # Note: val PPL after epoch 1
 
      Step 1: After Phase 1-2 (Python-only changes)
@@ -295,7 +295,7 @@ KSSM Throughput Optimization Plan: SOTA-Competitive Block
      #    Same benchmark snippet as Step 0. Expect ~1.3-1.5x speedup.
 
      # 2. WikiText training — 1 epoch, same config
-     python scripts/train.py --config configs/default.yaml --seed 42
+     python -m cdssm.train --config configs/default.yaml --seed 42
      # Acceptance: val PPL within 5% of baseline (fusion + utility removal are
      # mathematically neutral for fusion, minor for utility gate removal)
 
@@ -307,7 +307,7 @@ KSSM Throughput Optimization Plan: SOTA-Competitive Block
      #    Same snippet. Expect ~2x speedup from eliminating elementwise overhead.
 
      # 2. WikiText training — 1 epoch
-     python scripts/train.py --config configs/default.yaml --seed 42
+     python -m cdssm.train --config configs/default.yaml --seed 42
      # Acceptance: val PPL within 5% of Step 1 (mathematically equivalent)
 
      Step 3: After Phase 4 (fused normalize kernel)
@@ -318,7 +318,7 @@ KSSM Throughput Optimization Plan: SOTA-Competitive Block
      #    Target: >500K tokens/sec (>2x baseline ~246K)
 
      # 2. WikiText training — full run (20 epochs)
-     python scripts/train.py --config configs/default.yaml --seed 42
+     python -m cdssm.train --config configs/default.yaml --seed 42
      # Report final val PPL. Must be ≤ baseline val PPL (no regression).
      # This is the definitive evaluation.
 

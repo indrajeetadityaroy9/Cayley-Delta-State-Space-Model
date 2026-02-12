@@ -96,7 +96,7 @@ class TestCayleyVPGradients:
     """Gradient tests for CayleyVPFn."""
 
     def test_backward_with_gate(self, device):
-        from kssm.ops import cayley_vp_cuda
+        from cdssm.ops import cayley_vp_cuda
 
         B, L, H = 1, 32, 4
         torch.manual_seed(42)
@@ -133,7 +133,7 @@ class TestAdaptiveDtGradients:
     """Gradient tests for AdaptiveDtFn."""
 
     def test_backward(self, device):
-        from kssm.ops import adaptive_dt_cuda
+        from cdssm.ops import adaptive_dt_cuda
 
         B, L, H = 1, 32, 4
         torch.manual_seed(42)
@@ -174,7 +174,7 @@ class TestIntraChunkScanGradients:
     """Gradient tests for IntraChunkScanFn."""
 
     def test_backward(self, device):
-        from kssm.ops import intra_chunk_scan_cuda
+        from cdssm.ops import intra_chunk_scan_cuda
 
         BNC, C, H, D = 2, 8, 2, 16
         torch.manual_seed(42)
@@ -227,7 +227,7 @@ class TestInterChunkScanGradients:
     """Gradient tests for InterChunkScanFn."""
 
     def test_backward(self, device):
-        from kssm.ops import inter_chunk_scan_cuda
+        from cdssm.ops import inter_chunk_scan_cuda
 
         B, NC, H, D = 1, 4, 2, 16
         torch.manual_seed(42)

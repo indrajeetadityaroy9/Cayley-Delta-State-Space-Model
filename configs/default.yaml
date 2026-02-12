@@ -9,7 +9,7 @@ data:
   prefetch_factor: 4
 
 model:
-  name: KSSMLMHeadModel
+  name: CDSSMLMHeadModel
   d_model: 768
   n_layers: 12
 

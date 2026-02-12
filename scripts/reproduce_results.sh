@@ -7,4 +7,7 @@ export PYTHONHASHSEED=42
 
 SEED=42
 
-python scripts/train.py --config configs/default.yaml --seed "$SEED"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+python3 -m cdssm.train --config "${REPO_ROOT}/configs/default.yaml" --seed "$SEED"

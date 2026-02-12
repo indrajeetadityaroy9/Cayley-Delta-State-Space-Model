@@ -1,4 +1,4 @@
-"""CUDA extension building for KSSM.
+"""CUDA extension building for the CDSSM package.
 
 All project metadata and dependencies are in pyproject.toml.
 This file only handles CUDA extension compilation.
@@ -16,7 +16,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 
 def get_cuda_extensions():
     """Build CUDA extensions."""
-    csrc_dir = Path("src") / "kssm" / "csrc"
+    csrc_dir = Path("cdssm") / "csrc"
     kernel_dir = csrc_dir / "kernels"
     cu_files = list((_PROJECT_ROOT / kernel_dir).glob("*.cu"))
 
@@ -27,7 +27,7 @@ def get_cuda_extensions():
 
     ext_modules = [
         CUDAExtension(
-            name="kssm._C",
+            name="cdssm._C",
             sources=sources,
             include_dirs=include_dirs,
             extra_compile_args={

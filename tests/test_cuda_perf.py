@@ -1,9 +1,9 @@
 """Performance benchmarks for CUDA kernels using torch.cuda.Event timers.
 
 Benchmarks each kernel individually (forward + backward) and the full
-KSSMBlock forward+backward pass.
+CDSSMBlock forward+backward pass.
 
-Shapes: B=4, L=1024, H=12, D=64 (default KSSM config with d_model=384).
+Shapes: B=4, L=1024, H=12, D=64 (default CDSSM config with d_model=384).
 """
 
 import math
@@ -46,7 +46,7 @@ class TestKernelPerformance:
     """Per-kernel forward+backward timing."""
 
     def test_cayley_vp_perf(self, device):
-        from kssm.ops import cayley_vp_cuda
+        from cdssm.ops import cayley_vp_cuda
 
         B, L, H = 4, 1024, 12
         gating_c = math.log(8192)
@@ -64,7 +64,7 @@ class TestKernelPerformance:
         print(f"\ncayley_vp fwd+bwd: {t:.3f} ms (B={B}, L={L}, H={H})")
 
     def test_adaptive_dt_perf(self, device):
-        from kssm.ops import adaptive_dt_cuda
+        from cdssm.ops import adaptive_dt_cuda
 
         B, L, H = 4, 1024, 12
         eps_bf16 = torch.finfo(torch.bfloat16).eps
@@ -85,7 +85,7 @@ class TestKernelPerformance:
         print(f"\nadaptive_dt fwd+bwd: {t:.3f} ms (B={B}, L={L}, H={H})")
 
     def test_intra_chunk_scan_perf(self, device):
-        from kssm.ops import intra_chunk_scan_cuda
+        from cdssm.ops import intra_chunk_scan_cuda
 
         B, L, H, D = 4, 1024, 12, 64
         C = 64
@@ -116,7 +116,7 @@ class TestKernelPerformance:
         print(f"\nintra_chunk_scan fwd+bwd: {t:.3f} ms (BNC={BNC}, C={C}, H={H}, D={D})")
 
     def test_inter_chunk_scan_perf(self, device):
-        from kssm.ops import inter_chunk_scan_cuda
+        from cdssm.ops import inter_chunk_scan_cuda
 
         B, NC, H, D = 4, 16, 12, 64
 
@@ -142,17 +142,17 @@ class TestKernelPerformance:
 
 
 class TestBlockPerformance:
-    """Full KSSMBlock forward+backward timing."""
+    """Full CDSSMBlock forward+backward timing."""
 
     def test_full_block_perf(self, device):
-        from kssm.config.defaults import KSSMConfig
-        from kssm.models.kssm_block import KSSMBlock
+        from cdssm.config import CDSSMConfig
+        from cdssm.models.block import CDSSMBlock
 
-        config = KSSMConfig(d_model=384, n_layers=12, context_length=8192)
+        config = CDSSMConfig(d_model=384, n_layers=12, context_length=8192)
         B, L = 4, 1024
 
         torch.manual_seed(42)
-        block = KSSMBlock(config, layer_idx=0).to(device).to(torch.bfloat16)
+        block = CDSSMBlock(config, layer_idx=0).to(device).to(torch.bfloat16)
         x = torch.randn(B, L, config.d_model, device=device, dtype=torch.bfloat16)
 
         # Forward only
@@ -171,7 +171,7 @@ class TestBlockPerformance:
 
         t_fwd_bwd = benchmark_fn(fwd_bwd)
 
-        print(f"\nKSSMBlock (d_model={config.d_model}, H={config.n_heads}, D={config.head_dim}):")
+        print(f"\nCDSSMBlock (d_model={config.d_model}, H={config.n_heads}, D={config.head_dim}):")
         print(f"  Forward:          {t_fwd:.3f} ms  (B={B}, L={L})")
         print(f"  Forward+Backward: {t_fwd_bwd:.3f} ms  (B={B}, L={L})")
         print(f"  Throughput:       {B * L / (t_fwd_bwd / 1000):.0f} tokens/sec")

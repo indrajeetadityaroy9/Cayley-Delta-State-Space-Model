@@ -1,6 +1,6 @@
 """End-to-end 100-step training test.
 
-Verifies that the CUDA-accelerated KSSM can train stably for 100 steps
+Verifies that the CUDA-accelerated CDSSM can train stably for 100 steps
 on synthetic data. Checks:
 1. Loss decreases over training
 2. No NaN/Inf in loss or parameters
@@ -22,14 +22,14 @@ def device():
 
 
 def test_100_step_training(device):
-    from kssm.config.defaults import KSSMConfig
-    from kssm.models.kssm_block import KSSMBlock
+    from cdssm.config import CDSSMConfig
+    from cdssm.models.block import CDSSMBlock
 
     # Config: small model for testing
-    config = KSSMConfig(d_model=128, n_layers=2, context_length=1024)
+    config = CDSSMConfig(d_model=128, n_layers=2, context_length=1024)
 
     torch.manual_seed(42)
-    block = KSSMBlock(config, layer_idx=0).to(device).to(torch.bfloat16)
+    block = CDSSMBlock(config, layer_idx=0).to(device).to(torch.bfloat16)
 
     optimizer = torch.optim.AdamW(block.parameters(), lr=1e-3, weight_decay=0.01)
 
