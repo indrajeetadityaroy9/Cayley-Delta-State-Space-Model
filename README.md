@@ -34,7 +34,7 @@ Each `CDSSMBlock` (`cdssm/models/block.py`) executes one cohesive recurrent upda
    Paper: https://arxiv.org/abs/2405.21060  
    Motivates SSD chunkwise training algorithm used in `cdssm/models/ssd.py`.
 2. **Gated Delta Networks**  
-   Paper: https://arxiv.org/abs/2410.04484  
+   Paper: https://arxiv.org/abs/2412.06464 
    Informs gated delta-rule memory update design in `cdssm/models/block.py` and `cdssm/models/ssd.py`.
 3. **Griffin (RG-LRU gating)**  
    Paper: https://arxiv.org/abs/2402.19427  
