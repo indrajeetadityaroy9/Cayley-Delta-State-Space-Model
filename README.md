@@ -46,5 +46,5 @@ Each `CDSSMBlock` (`cdssm/models/block.py`) executes one cohesive recurrent upda
    Paper: https://arxiv.org/abs/1909.13334  
    Inspires structure-preserving dynamics viewpoint (adapted here to dissipative Cayley dynamics).
 6. **Attention when you need**  
-   Paper: https://arxiv.org/abs/2407.07120  
+   Paper: https://arxiv.org/abs/2501.07440 
    Relationship: motivates explicit utility/cost trade-off perspective used by auxiliary gating regularization.
