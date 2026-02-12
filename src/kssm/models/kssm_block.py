@@ -5,12 +5,12 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from kssm.config.defaults import KSSMConfig
+from kssm.ops import cayley_vp_cuda
 from .ssd import SSDChunkwiseScan
 from .components import (
     AdaptiveTimestep,
     Conv1dSiLU,
     compute_variance_preserving_std,
-    compute_variance_preserving_scale_gated,
     apply_spectral_init,
     RMSNorm,
 )
@@ -68,7 +68,7 @@ class KSSMBlock(nn.Module):
         self.adaptive_dt = AdaptiveTimestep(self.n_heads)
 
         # SSD Scanner (Mamba-2 algorithm)
-        self.ssd_scan = SSDChunkwiseScan(self.d_inner, self.n_heads, gating_c=self._gating_c)
+        self.ssd_scan = SSDChunkwiseScan(self.d_inner, self.n_heads)
 
         # Utility Gating (state-conditioned via EMA energy)
         self.utility_gate = nn.Linear(self.d_inner, self.n_heads, bias=True)
@@ -233,21 +233,14 @@ class KSSMBlock(nn.Module):
         # Learned recurrence gate (Griffin RG-LRU style)
         r_gate = torch.sigmoid(self.recurrence_gate(x_conv_cast))  # (B, L, H)
 
-        # Variance-preserving gating with learned recurrence gate
-        vp_scale = compute_variance_preserving_scale_gated(alpha, omega, dt, r_gate, c=self._gating_c)
-        V_gated = V * vp_scale.unsqueeze(-1)  # (B, L, H, 2) * (B, L, H, 1)
-
         # State-conditioned utility gating via EMA energy
-        state_signal = self.state_gate_proj(self._ema_energy)  # (H,)
+        state_signal = self.state_gate_proj(self._ema_energy.clone().detach())  # (H,)
         u_logit = self.utility_gate(x_conv_cast) + state_signal  # broadcast to (B, L, H)
 
         u_gate = torch.sigmoid(u_logit)
 
         # Store mean activation for loss computation (L1 sparsity)
         self._metabolic_loss = u_gate.mean()
-
-        # Modulate V with utility gate
-        V_gated = V_gated * u_gate.unsqueeze(-1)  # (B, L, H, 2) * (B, L, H, 1)
 
         # L2-normalize keys for delta-rule stability
         K = F.normalize(K, dim=-1)
@@ -262,16 +255,20 @@ class KSSMBlock(nn.Module):
         # Delta-rule update gate
         beta = torch.sigmoid(self.beta_proj(x_conv_cast))  # (B, L, H)
 
-        # Evolution via Cayley discretization (Chunkwise Parallel Scan)
-        Y, chunk_states = self.ssd_scan(
-            alpha, omega, dt, K, V_gated, beta=beta, r_gate=r_gate,
-        )
+        # Fused Cayley discretization + recurrence gate + VP scale (CUDA kernel)
+        A_bar, vp_scale = cayley_vp_cuda(alpha, omega, dt, r_gate, self._gating_c)
+
+        # Apply VP scale and utility gate to V before scan
+        V_gated = V * (vp_scale * u_gate).unsqueeze(-1)  # (B, L, H, 2)
+
+        # Chunkwise Parallel Scan (CUDA kernels for intra/inter-chunk)
+        Y, chunk_states = self.ssd_scan(A_bar, K, V_gated, beta)
 
         # Update EMA energy from chunk states
         if self.training:
             # chunk_states: (B, NC, H, 2, D) -> energy per head
             current_energy = chunk_states.pow(2).sum(dim=(-1, -2)).mean(dim=(0, 1))  # (H,)
-            self._ema_energy = self._ema_decay * self._ema_energy + (1.0 - self._ema_decay) * current_energy.detach()
+            self._ema_energy.copy_(self._ema_decay * self._ema_energy + (1.0 - self._ema_decay) * current_energy.detach())
 
         # Readout: retrieve 2-vectors from matrix state using Q
         # Y: (B, L, H, 2, D), Q: (B, L, H, D) -> retrieved: (B, L, H, 2)
@@ -281,8 +278,13 @@ class KSSMBlock(nn.Module):
         y = self.readout_proj(retrieved.reshape(batch, seq_len, -1))  # (B, L, d_inner)
 
         # GroupNorm in fp32 for numerical stability
+        y_dtype = y.dtype
         y_for_norm = y.float().transpose(1, 2)
-        y = self.ssm_norm(y_for_norm).to(y.dtype).transpose(1, 2)
+        y = F.group_norm(
+            y_for_norm, self.ssm_norm.num_groups,
+            self.ssm_norm.weight.float(), self.ssm_norm.bias.float(),
+            self.ssm_norm.eps,
+        ).to(y_dtype).transpose(1, 2)
         y = y * F.silu(z)
         y = y + self.D * x_conv
 

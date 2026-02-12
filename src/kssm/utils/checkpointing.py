@@ -2,7 +2,7 @@ import datetime
 from pathlib import Path
 import torch
 import torch.nn as nn
-from src.kssm.config.defaults import KSSMConfig
+from kssm.config.defaults import KSSMConfig
 
 def save_checkpoint(
     model: nn.Module,

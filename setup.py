@@ -16,12 +16,14 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 
 def get_cuda_extensions():
     """Build CUDA extensions."""
-    csrc_dir = _PROJECT_ROOT / "src" / "kssm" / "csrc"
+    csrc_dir = Path("src") / "kssm" / "csrc"
     kernel_dir = csrc_dir / "kernels"
-    cu_files = list(kernel_dir.glob("*.cu"))
+    cu_files = list((_PROJECT_ROOT / kernel_dir).glob("*.cu"))
 
-    sources = [str(csrc_dir / "binding.cpp")] + [str(f) for f in cu_files]
-    include_dirs = [str(csrc_dir / "include"), pybind11.get_include()]
+    sources = [str(csrc_dir / "binding.cpp")] + [
+        str(csrc_dir / "kernels" / f.name) for f in cu_files
+    ]
+    include_dirs = [str(_PROJECT_ROOT / csrc_dir / "include"), pybind11.get_include()]
 
     ext_modules = [
         CUDAExtension(

@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from kssm.ops import conv1d_silu_cuda
+from kssm.ops import conv1d_silu_cuda, adaptive_dt_cuda
 
 
 def bf16_safety_constants(dtype: torch.dtype) -> tuple[float, float, float]:
@@ -24,46 +24,6 @@ def bf16_safety_constants(dtype: torch.dtype) -> tuple[float, float, float]:
     smoothness = omega_thresh / 5.0
     return omega_thresh, delta, smoothness
 
-
-
-# Variance-Preserving Scale (Griffin RG-LRU style)
-
-def compute_variance_preserving_scale_gated(
-    alpha: Tensor,
-    omega: Tensor,
-    dt: Tensor,
-    r_gate: Tensor,
-    c: float = 8.0,
-    eps: float = 1e-6,
-) -> Tensor:
-    """Compute learnable VP scale with Griffin RG-LRU-style recurrence gate.
-
-    The learned gate r_t modulates the effective eigenvalue decay via
-    exponentiation: effective_eig = eig^(c * r_t). When r_t -> 0, the
-    effective decay is minimal (state held). When r_t -> 1, the decay
-    is amplified (state flushed). This gives the model control over
-    retention independent of the Hamiltonian dynamics.
-
-    Args:
-        alpha, omega, dt: (B, L, H) dynamics parameters
-        r_gate: (B, L, H) learned recurrence gate in [0, 1]
-        c: gating range constant (default 8.0, matching Griffin)
-        eps: numerical stability constant
-    """
-    tau = dt * 0.5
-    tau_alpha = tau * alpha
-    tau_omega = tau * omega
-
-    # |eigenvalue(A_bar)|^2 = ((1-tau*alpha)^2 + (tau*omega)^2) / ((1+tau*alpha)^2 + (tau*omega)^2)
-    numer = (1.0 - tau_alpha).square() + tau_omega.square()
-    denom = (1.0 + tau_alpha).square() + tau_omega.square()
-    eig_sq = numer / (denom + eps)
-
-    # Modulate decay via learned gate
-    effective_eig_sq = eig_sq.pow(c * r_gate)
-
-    scale = torch.sqrt((1.0 - effective_eig_sq).clamp(min=eps))
-    return scale.clamp(max=1.0)
 
 
 # Variance-Preserving Initialization (T-Fixup style)
@@ -118,29 +78,12 @@ class AdaptiveTimestep(nn.Module):
         self.log_dt_scale = nn.Parameter(torch.zeros(n_heads))
 
     def forward(self, alpha: Tensor, omega: Tensor) -> Tensor:
-        """Compute adaptive dt from dynamics."""
-        # Characteristic frequency: sum of damping and oscillation rate
-        characteristic_freq = alpha + omega.abs() + self._eps
-
-        # Learned scale (always positive via softplus)
-        dt_scale = F.softplus(self.log_dt_scale)
-
-        # dt = scale / frequency (CFL-like condition)
-        dt_raw = dt_scale / characteristic_freq
-
-        # Smooth Safety Cap for bf16 precision collapse
-        # dt_max = (2 - delta) / alpha ensures tau*alpha < 1 - delta/2
-        dt_max = (2.0 - self._delta) / (alpha + self._eps)
-
-        # Smooth blend weight: w -> 1 when |omega| << omega_thresh
-        omega_abs = omega.abs()
-        w = torch.sigmoid((self._omega_thresh - omega_abs) / self._smoothness)
-
-        # Apply cap smoothly: only engage when omega is small
-        dt_capped = torch.minimum(dt_raw, dt_max)
-        dt = w * dt_capped + (1.0 - w) * dt_raw
-
-        return dt
+        """Compute adaptive dt from dynamics (fused CUDA kernel)."""
+        return adaptive_dt_cuda(
+            alpha, omega, self.log_dt_scale.float(),
+            self._omega_thresh.item(), self._delta.item(),
+            self._smoothness.item(), self._eps,
+        )
 
 
 # Conv1dSiLU - Fused Depthwise Conv1d + SiLU using CUDA kernel

@@ -1,18 +1,14 @@
 #!/usr/bin/env python
 import argparse
 import math
-import sys
 from pathlib import Path
 import yaml
 import torch
 from torch.utils.data import DataLoader
 
-# Add src to path
-sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
-
 from kssm.config.defaults import KSSMConfig
 from kssm.models.language_model import KSSMLMHeadModel
-from kssm.data.datasets import WikiTextDataset
+from kssm.data.datasets import build_dataset
 from kssm.training.trainer import train_one_epoch
 from kssm.training.optim import build_param_groups, build_cosine_schedule
 from kssm.evaluation.evaluator import evaluate_epoch
@@ -37,8 +33,8 @@ def main():
 
     # Data
     context_length = config_dict["data"]["context_length"]
-    train_dataset = WikiTextDataset("train", context_length)
-    val_dataset = WikiTextDataset("validation", context_length)
+    train_dataset = build_dataset(config_dict["data"], "train")
+    val_dataset = build_dataset(config_dict["data"], "validation")
 
     vocab_size = train_dataset.tokenizer.vocab_size
     n_layers = config_dict["model"]["n_layers"]
