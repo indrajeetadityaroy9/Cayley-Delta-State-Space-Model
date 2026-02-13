@@ -241,10 +241,120 @@ def adaptive_dt_cuda(
     )
 
 
+# Fused Dynamics Pipeline (Phase 3)
+
+class DynamicsFusedFn(Function):
+    """Fused dynamics: gate_raw → A_bar, vp_scale, beta, sel_C_gate in one kernel."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        gate_raw: Tensor,        # (B, L, 7*H) BF16
+        log_dt_scale: Tensor,    # (H,) FP32
+        rope_freqs: Tensor,      # (H,) FP32
+        gating_c: float,
+        omega_thresh: float,
+        adt_delta: float,
+        adt_smoothness: float,
+        adt_eps: float,
+        n_heads: int,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        A_bar, vp_scale, beta, sel_C_gate = _C.dynamics_fused_fwd_cuda(
+            gate_raw, log_dt_scale, rope_freqs,
+            gating_c, omega_thresh, adt_delta, adt_smoothness, adt_eps,
+            n_heads,
+        )
+        ctx.save_for_backward(gate_raw, log_dt_scale, rope_freqs)
+        ctx.gating_c = gating_c
+        ctx.omega_thresh = omega_thresh
+        ctx.adt_delta = adt_delta
+        ctx.adt_smoothness = adt_smoothness
+        ctx.adt_eps = adt_eps
+        ctx.n_heads = n_heads
+        return A_bar, vp_scale, beta, sel_C_gate
+
+    @staticmethod
+    def backward(
+        ctx, grad_A_bar: Tensor, grad_vp_scale: Tensor,
+        grad_beta: Tensor, grad_sel_C_gate: Tensor,
+    ) -> tuple[Tensor, Tensor, None, None, None, None, None, None, None]:
+        gate_raw, log_dt_scale, rope_freqs = ctx.saved_tensors
+        grad_gate_raw, grad_log_dt_scale = _C.dynamics_fused_bwd_cuda(
+            grad_A_bar, grad_vp_scale, grad_beta, grad_sel_C_gate,
+            gate_raw, log_dt_scale, rope_freqs,
+            ctx.gating_c, ctx.omega_thresh,
+            ctx.adt_delta, ctx.adt_smoothness, ctx.adt_eps,
+            ctx.n_heads,
+        )
+        return grad_gate_raw, grad_log_dt_scale, None, None, None, None, None, None, None
+
+
+def dynamics_fused_cuda(
+    gate_raw: Tensor, log_dt_scale: Tensor, rope_freqs: Tensor,
+    gating_c: float, omega_thresh: float, adt_delta: float,
+    adt_smoothness: float, adt_eps: float, n_heads: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Fused dynamics pipeline: gate_raw → (A_bar, vp_scale, beta, sel_C_gate).
+
+    Replaces adaptive_dt_cuda + cayley_vp_cuda + ~15 elementwise PyTorch ops.
+
+    Args:
+        gate_raw: (B, L, 7*H) raw gate projection output (BF16)
+        log_dt_scale: (H,) learned per-head scale (FP32)
+        rope_freqs: (H,) RoPE frequencies (FP32)
+        gating_c, omega_thresh, adt_delta, adt_smoothness, adt_eps: scalar constants
+        n_heads: number of attention heads
+
+    Returns:
+        A_bar: (B, L, H, 2, 2) discretized transition matrices
+        vp_scale: (B, L, H) variance-preserving scale
+        beta: (B, L, H) fused write gate = sigmoid(beta_raw) * sigmoid(sel_B)
+        sel_C_gate: (B, L, H) read gate = sigmoid(sel_C)
+    """
+    return DynamicsFusedFn.apply(
+        gate_raw, log_dt_scale, rope_freqs,
+        gating_c, omega_thresh, adt_delta, adt_smoothness, adt_eps, n_heads,
+    )
+
+
+# Fused K/Q L2 Normalization (Phase 4)
+
+class NormalizeKQFn(Function):
+    """Fused L2 normalization for K and Q vectors."""
+
+    @staticmethod
+    def forward(ctx, K: Tensor, Q: Tensor) -> tuple[Tensor, Tensor]:
+        K_norm, Q_norm = _C.normalize_kq_fwd_cuda(K, Q)
+        ctx.save_for_backward(K, Q)
+        return K_norm, Q_norm
+
+    @staticmethod
+    def backward(ctx, grad_K_out: Tensor, grad_Q_out: Tensor) -> tuple[Tensor, Tensor]:
+        K, Q = ctx.saved_tensors
+        grad_K_in, grad_Q_in = _C.normalize_kq_bwd_cuda(grad_K_out, grad_Q_out, K, Q)
+        return grad_K_in, grad_Q_in
+
+
+def normalize_kq_cuda(K: Tensor, Q: Tensor) -> tuple[Tensor, Tensor]:
+    """Fused L2 normalization for K and Q vectors.
+
+    Args:
+        K: (B, L, H, D) key vectors (BF16)
+        Q: (B, L, H, D) query vectors (BF16)
+
+    Returns:
+        K_norm: (B, L, H, D) L2-normalized keys
+        Q_norm: (B, L, H, D) L2-normalized queries
+    """
+    return NormalizeKQFn.apply(K, Q)
+
+
 __all__ = [
     "conv1d_silu_cuda",
     "intra_chunk_scan_cuda",
     "inter_chunk_scan_cuda",
     "cayley_vp_cuda",
     "adaptive_dt_cuda",
+    "dynamics_fused_cuda",
+    "normalize_kq_cuda",
 ]

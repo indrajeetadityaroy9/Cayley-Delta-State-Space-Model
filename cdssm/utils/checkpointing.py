@@ -2,7 +2,7 @@ import datetime
 from pathlib import Path
 import torch
 import torch.nn as nn
-from cdssm.config import CDSSMConfig
+from cdssm.config.defaults import CDSSMConfig
 
 def save_checkpoint(
     model: nn.Module,

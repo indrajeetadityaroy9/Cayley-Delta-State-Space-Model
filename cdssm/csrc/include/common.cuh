@@ -250,6 +250,21 @@ __device__ __forceinline__ float warp_broadcast(float val, int src_lane = 0) {
 }
 
 // Constants
+//
+// Derivation references (see cdssm/config/defaults.py derive_epsilon_hierarchy):
+//
+// EPS_DEFAULT (1e-6): Cayley det safety → compute_eps (FP32 machine epsilon).
+//   Conservative: det = 1 + (αdt)² + (ωdt)² ≥ 1, so compute_eps suffices.
+//   Python config: config.eps_cayley_det.
+//
+// NORM_EPS_DEFAULT (1e-5): L2 norm safety → io_eps² (BF16 machine epsilon squared).
+//   Constraint: rsqrt gradient O(eps^{-1/2}) must be representable in I/O dtype.
+//   eps^{-1/2} < 1/io_eps → eps > io_eps² = 6.1e-5. CUDA uses 1e-5 (conservative).
+//   Python config: config.eps_norm.
+//
+// softplus threshold (20.0f in softplus()): Mathematical identity.
+//   log(1 + exp(20)) = 20 + 2.1e-9 ≈ 20. Error < FP32 machine epsilon.
+//   Not tunable — determined by FP32 precision.
 
 constexpr float EPS_DEFAULT = 1e-6f;
 constexpr float NORM_EPS_DEFAULT = 1e-5f;

@@ -9,64 +9,33 @@ evaluated with the standard Mamba/SSM zero-shot benchmark suite::
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
-from transformers import AutoTokenizer
 
-from cdssm.config import CDSSMConfig
-from cdssm.models.model import CDSSMLMHeadModel
+from cdssm.inference.predict import load_model_from_checkpoint
 
-# Fields computed in __post_init__ — must not be passed to the constructor.
-_COMPUTED_FIELDS = frozenset({"d_inner", "n_heads", "head_dim", "ssm_norm_groups"})
+_DEVICE = torch.device("cuda")
+
+# H100 80 GB / 26 vCPU defaults
+_BATCH_SIZE = 64
 
 
 class CDSSMEvalWrapper(LM):
     """Wraps a CDSSM checkpoint for lm-evaluation-harness (v0.4.2)."""
 
-    def __init__(
-        self,
-        checkpoint_path: str,
-        device: str = "cuda",
-        batch_size: int = 1,
-        max_length: Optional[int] = None,
-    ):
+    def __init__(self, checkpoint_path: str):
         super().__init__()
-        self._device = torch.device(device)
-        self._batch_size = batch_size
+        self._device = _DEVICE
+        self._batch_size = _BATCH_SIZE
 
-        # ---- Load checkpoint ------------------------------------------------
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        cfg_dict = ckpt["config"]
+        self.model, self.tokenizer = load_model_from_checkpoint(checkpoint_path)
+        self._max_length = self.model.config.context_length
 
-        # Reconstruct CDSSMConfig (skip computed fields)
-        init_kwargs = {
-            k: v for k, v in cfg_dict.items()
-            if k in CDSSMConfig.__dataclass_fields__ and k not in _COMPUTED_FIELDS
-        }
-        config = CDSSMConfig(**init_kwargs)
-        self._max_length = max_length or config.context_length
-
-        # Build model
-        vocab_size = cfg_dict.get("vocab_size", 50257)
-        self.model = CDSSMLMHeadModel(config, vocab_size)
-
-        # Handle torch.compile `_orig_mod.` prefix in state dicts
-        state_dict = ckpt["model_state_dict"]
-        cleaned = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-        self.model.load_state_dict(cleaned, strict=False)
-        self.model.to(self._device).bfloat16().eval()
-
-        # ---- Tokenizer ------------------------------------------------------
-        self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-
-    # ------------------------------------------------------------------
     # Required LM properties
-    # ------------------------------------------------------------------
 
     @property
     def eot_token_id(self) -> int:
@@ -88,9 +57,7 @@ class CDSSMEvalWrapper(LM):
     def device(self) -> torch.device:
         return self._device
 
-    # ------------------------------------------------------------------
     # Helpers
-    # ------------------------------------------------------------------
 
     def tok_encode(self, string: str) -> list[int]:
         return self.tokenizer.encode(string, add_special_tokens=False)
@@ -100,14 +67,12 @@ class CDSSMEvalWrapper(LM):
 
     @torch.no_grad()
     def _model_logits(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Forward pass → logits in float32."""
+        """Forward pass -> logits in float32."""
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             logits = self.model(input_ids.to(self._device))
         return logits.float()
 
-    # ------------------------------------------------------------------
     # LM API: loglikelihood
-    # ------------------------------------------------------------------
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         results: list[tuple[float, bool]] = []
@@ -117,7 +82,6 @@ class CDSSMEvalWrapper(LM):
             cont_ids = self.tok_encode(continuation)
 
             all_ids = (ctx_ids + cont_ids)[-self.max_length:]
-            # How many continuation tokens survived the truncation
             n_cont = min(len(cont_ids), len(all_ids))
             cont_start = len(all_ids) - n_cont
 
@@ -128,7 +92,7 @@ class CDSSMEvalWrapper(LM):
             total_ll = 0.0
             is_greedy = True
             for i in range(n_cont):
-                pos = cont_start + i - 1  # logit at pos predicts token at pos+1
+                pos = cont_start + i - 1
                 tok = all_ids[cont_start + i]
                 if pos >= 0:
                     total_ll += log_probs[pos, tok].item()
@@ -138,9 +102,7 @@ class CDSSMEvalWrapper(LM):
             results.append((total_ll, is_greedy))
         return results
 
-    # ------------------------------------------------------------------
     # LM API: loglikelihood_rolling  (used by `wikitext` perplexity)
-    # ------------------------------------------------------------------
 
     def loglikelihood_rolling(self, requests: List[Instance]) -> List[Tuple[float]]:
         results: list[tuple[float]] = []
@@ -152,7 +114,8 @@ class CDSSMEvalWrapper(LM):
                 continue
 
             total_ll = 0.0
-            # Sliding window with stride = max_length
+            # Non-overlapping windows without hidden-state carry-over:
+            # position 0 of every chunk has no prior context, so skip it.
             for start in range(0, len(token_ids), self.max_length):
                 end = min(start + self.max_length, len(token_ids))
                 chunk = token_ids[start:end]
@@ -163,18 +126,15 @@ class CDSSMEvalWrapper(LM):
                 logits = self._model_logits(input_ids)
                 log_probs = F.log_softmax(logits[0], dim=-1)
 
-                # First chunk: predict from position 1 onward.
-                # Subsequent chunks: predict all positions (context was prior chunk).
-                pred_start = 1 if start == 0 else 0
-                for i in range(pred_start, len(chunk)):
+                # log_probs[i-1] predicts chunk[i]; start from i=1 since
+                # position 0 has no context in an independent forward pass
+                for i in range(1, len(chunk)):
                     total_ll += log_probs[i - 1, chunk[i]].item()
 
             results.append((total_ll,))
         return results
 
-    # ------------------------------------------------------------------
     # LM API: generate_until
-    # ------------------------------------------------------------------
 
     def generate_until(self, requests: List[Instance]) -> List[str]:
         results: list[str] = []

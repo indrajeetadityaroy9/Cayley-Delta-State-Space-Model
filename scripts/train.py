@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Compatibility wrapper. Prefer: python -m cdssm.train"""
 
 from cdssm.train import main

@@ -7,8 +7,6 @@ data:
   text_field: text
   context_length: 1024
   num_tokens: 300000000  # 300M tokens (streaming)
-  num_workers: 4
-  prefetch_factor: 4
 
 model:
   name: CDSSMLMHeadModel
@@ -17,14 +15,14 @@ model:
 
 training:
   epochs: 1
-  batch_size: 4
   grad_accum_steps: 8
   base_lr: 6e-4
   weight_decay: 0.1
   betas: [0.9, 0.95]
   warmup_steps: 500
-  device: cuda
   precision: bfloat16
+  grad_clip: 1.0
+  min_lr_ratio: 0.0
 
 checkpointing:
   save_dir: checkpoints

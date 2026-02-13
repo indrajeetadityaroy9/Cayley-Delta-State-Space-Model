@@ -1,17 +1,22 @@
-#!/usr/bin/env python
 """Module entrypoint for model training."""
 
 import argparse
+import math
 import os
+import random
 from pathlib import Path
 
+import numpy as np
 import torch
+from torch.utils.data import DataLoader
 import yaml
 
+_DEVICE = torch.device("cuda")
 
-def load_config(config_path: str) -> dict:
-    with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+# H100 80 GB / 26 vCPU defaults
+_BATCH_SIZE = 8
+_NUM_WORKERS = 8
+_PREFETCH_FACTOR = 4
 
 
 def main() -> None:
@@ -20,35 +25,56 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
-    from cdssm.config import CDSSMConfig
-    from cdssm.data import build_dataset, build_dataloaders
+    from cdssm.config.defaults import CDSSMConfig
+    from cdssm.data.datasets import build_dataset
     from cdssm.evaluation.evaluator import evaluate_epoch
-    from cdssm.evaluation.metrics import perplexity_from_loss
     from cdssm.models.model import CDSSMLMHeadModel
     from cdssm.training.optim import build_cosine_schedule, build_param_groups
     from cdssm.training.trainer import train_one_epoch
     from cdssm.utils.checkpointing import save_checkpoint
     from cdssm.utils.seeding import seed_everything
 
-    config_dict = load_config(args.config)
+    with open(args.config, "r", encoding="utf-8") as f:
+        config_dict = yaml.safe_load(f)
+
     seed = args.seed if args.seed is not None else config_dict.get("seed", 42)
     seed_everything(seed)
 
-    device = torch.device(config_dict["training"]["device"])
-
     # Data
     context_length = config_dict["data"]["context_length"]
-    train_dataset = build_dataset(config_dict["data"], "train")
-    val_dataset = build_dataset(config_dict["data"], "validation")
+    tokenizer_name = config_dict.get("tokenizer_name", "gpt2")
+    train_dataset = build_dataset(config_dict["data"], "train", tokenizer_name=tokenizer_name)
+    val_dataset = build_dataset(config_dict["data"], "validation", tokenizer_name=tokenizer_name)
 
     vocab_size = train_dataset.tokenizer.vocab_size
     n_layers = config_dict["model"]["n_layers"]
+    ppl_clamp = math.log(vocab_size)
 
-    train_loader, val_loader = build_dataloaders(
+    # Dataloaders (inlined — no builder indirection)
+    def worker_init_fn(worker_id: int) -> None:
+        np.random.seed(seed + worker_id)
+        random.seed(seed + worker_id)
+
+    train_loader = DataLoader(
         train_dataset,
+        batch_size=_BATCH_SIZE,
+        shuffle=True,
+        num_workers=_NUM_WORKERS,
+        pin_memory=True,
+        worker_init_fn=worker_init_fn,
+        generator=torch.Generator().manual_seed(seed + 1000),
+        persistent_workers=True,
+        prefetch_factor=_PREFETCH_FACTOR,
+    )
+    val_loader = DataLoader(
         val_dataset,
-        config_dict["data"],
-        config_dict["training"],
+        batch_size=_BATCH_SIZE,
+        shuffle=False,
+        num_workers=_NUM_WORKERS,
+        pin_memory=True,
+        worker_init_fn=worker_init_fn,
+        persistent_workers=True,
+        prefetch_factor=_PREFETCH_FACTOR,
     )
 
     # Model
@@ -57,9 +83,10 @@ def main() -> None:
         n_layers=n_layers,
         context_length=context_length,
         vocab_size=vocab_size,
+        tokenizer_name=tokenizer_name,
     )
-    model = CDSSMLMHeadModel(model_config, vocab_size).to(device)
-    if config_dict["training"]["precision"] == "bfloat16":
+    model = CDSSMLMHeadModel(model_config).to(_DEVICE)
+    if config_dict["training"].get("precision", "bfloat16") == "bfloat16":
         model = model.bfloat16()
 
     model = torch.compile(model, mode="reduce-overhead")
@@ -77,7 +104,8 @@ def main() -> None:
     grad_accum_steps = config_dict["training"]["grad_accum_steps"]
     epochs = config_dict["training"]["epochs"]
     total_steps = len(train_loader) * epochs // grad_accum_steps
-    scheduler = build_cosine_schedule(optimizer, config_dict["training"]["warmup_steps"], total_steps)
+    min_lr_ratio = config_dict["training"].get("min_lr_ratio", 0.0)
+    scheduler = build_cosine_schedule(optimizer, config_dict["training"]["warmup_steps"], total_steps, min_lr_ratio=min_lr_ratio)
 
     best_val_ppl = float("inf")
     checkpoint_dir = Path(config_dict["checkpointing"]["save_dir"])
@@ -86,19 +114,20 @@ def main() -> None:
 
     for epoch in range(1, epochs + 1):
         print(f"\n=== Epoch {epoch}/{epochs} ===")
+        grad_clip = config_dict["training"].get("grad_clip", 1.0)
         train_loss = train_one_epoch(
             model,
             train_loader,
             optimizer,
             scheduler,
-            device,
             grad_accum_steps,
             vocab_size=vocab_size,
+            grad_clip=grad_clip,
         )
-        val_loss = evaluate_epoch(model, val_loader, device)
+        val_loss = evaluate_epoch(model, val_loader)
 
-        train_ppl = perplexity_from_loss(train_loss, vocab_size)
-        val_ppl = perplexity_from_loss(val_loss, vocab_size)
+        train_ppl = math.exp(min(train_loss, ppl_clamp))
+        val_ppl = math.exp(min(val_loss, ppl_clamp))
 
         print(f"Train PPL: {train_ppl:.2f} | Val PPL: {val_ppl:.2f}")
 

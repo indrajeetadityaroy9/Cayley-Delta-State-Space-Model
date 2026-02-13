@@ -6,8 +6,8 @@ from transformers import AutoTokenizer
 class WikiTextDataset(Dataset):
     """WikiText-103 tokenized with GPT-2 tokenizer."""
 
-    def __init__(self, split: str, context_length: int, cache_dir: str = None):
-        self.tokenizer = AutoTokenizer.from_pretrained("gpt2", cache_dir=cache_dir)
+    def __init__(self, split: str, context_length: int, tokenizer_name: str = "gpt2", cache_dir: str = None):
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, cache_dir=cache_dir)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.context_length = context_length
 
@@ -52,9 +52,10 @@ class StreamingLMDataset(Dataset):
         context_length: int,
         num_tokens: int = 300_000_000,
         text_field: str = "text",
+        tokenizer_name: str = "gpt2",
         cache_dir: str = None,
     ):
-        self.tokenizer = AutoTokenizer.from_pretrained("gpt2", cache_dir=cache_dir)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, cache_dir=cache_dir)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.context_length = context_length
 
@@ -93,14 +94,14 @@ class StreamingLMDataset(Dataset):
         return x, y
 
 
-def build_dataset(config: dict, split: str) -> Dataset:
+def build_dataset(config: dict, split: str, tokenizer_name: str = "gpt2") -> Dataset:
     """Factory: build a dataset from the data section of a YAML config."""
     name = config.get("dataset_name", "wikitext")
     ctx = config["context_length"]
     cache_dir = config.get("cache_dir", None)
 
     if name == "wikitext":
-        return WikiTextDataset(split, ctx, cache_dir=cache_dir)
+        return WikiTextDataset(split, ctx, tokenizer_name=tokenizer_name, cache_dir=cache_dir)
 
     return StreamingLMDataset(
         dataset_name=name,
@@ -109,5 +110,6 @@ def build_dataset(config: dict, split: str) -> Dataset:
         context_length=ctx,
         num_tokens=config.get("num_tokens", 300_000_000),
         text_field=config.get("text_field", "text"),
+        tokenizer_name=tokenizer_name,
         cache_dir=cache_dir,
     )

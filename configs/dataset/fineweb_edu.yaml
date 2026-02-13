@@ -3,5 +3,3 @@ dataset_config: default
 text_field: text
 context_length: 1024
 num_tokens: 300000000
-num_workers: 4
-prefetch_factor: 4

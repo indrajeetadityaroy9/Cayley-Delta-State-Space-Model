@@ -98,6 +98,52 @@ adaptive_dt_bwd_cuda(
     float eps
 );
 
+// Fused dynamics kernel (dynamics_fused.cu)
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+dynamics_fused_fwd_cuda(
+    torch::Tensor gate_raw,
+    torch::Tensor log_dt_scale,
+    torch::Tensor rope_freqs,
+    float gating_c,
+    float omega_thresh,
+    float adt_delta,
+    float adt_smoothness,
+    float adt_eps,
+    int H
+);
+
+std::tuple<torch::Tensor, torch::Tensor>
+dynamics_fused_bwd_cuda(
+    torch::Tensor grad_A_bar,
+    torch::Tensor grad_vp_scale,
+    torch::Tensor grad_beta,
+    torch::Tensor grad_sel_C_gate,
+    torch::Tensor gate_raw,
+    torch::Tensor log_dt_scale,
+    torch::Tensor rope_freqs,
+    float gating_c,
+    float omega_thresh,
+    float adt_delta,
+    float adt_smoothness,
+    float adt_eps,
+    int H
+);
+
+// Fused K/Q normalization (normalize_kq.cu)
+std::tuple<torch::Tensor, torch::Tensor>
+normalize_kq_fwd_cuda(
+    torch::Tensor K,
+    torch::Tensor Q
+);
+
+std::tuple<torch::Tensor, torch::Tensor>
+normalize_kq_bwd_cuda(
+    torch::Tensor grad_K_out,
+    torch::Tensor grad_Q_out,
+    torch::Tensor K,
+    torch::Tensor Q
+);
+
 }  // namespace cdssm
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -156,4 +202,31 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("grad_dt"), py::arg("alpha"), py::arg("omega"),
           py::arg("log_dt_scale"), py::arg("omega_thresh"),
           py::arg("delta"), py::arg("smoothness"), py::arg("eps"));
+
+    // Fused dynamics
+    m.def("dynamics_fused_fwd_cuda", &cdssm::dynamics_fused_fwd_cuda,
+          "Fused dynamics pipeline forward",
+          py::arg("gate_raw"), py::arg("log_dt_scale"), py::arg("rope_freqs"),
+          py::arg("gating_c"), py::arg("omega_thresh"),
+          py::arg("adt_delta"), py::arg("adt_smoothness"), py::arg("adt_eps"),
+          py::arg("H"));
+
+    m.def("dynamics_fused_bwd_cuda", &cdssm::dynamics_fused_bwd_cuda,
+          "Fused dynamics pipeline backward",
+          py::arg("grad_A_bar"), py::arg("grad_vp_scale"),
+          py::arg("grad_beta"), py::arg("grad_sel_C_gate"),
+          py::arg("gate_raw"), py::arg("log_dt_scale"), py::arg("rope_freqs"),
+          py::arg("gating_c"), py::arg("omega_thresh"),
+          py::arg("adt_delta"), py::arg("adt_smoothness"), py::arg("adt_eps"),
+          py::arg("H"));
+
+    // Fused K/Q normalization
+    m.def("normalize_kq_fwd_cuda", &cdssm::normalize_kq_fwd_cuda,
+          "Fused K/Q L2 normalization forward",
+          py::arg("K"), py::arg("Q"));
+
+    m.def("normalize_kq_bwd_cuda", &cdssm::normalize_kq_bwd_cuda,
+          "Fused K/Q L2 normalization backward",
+          py::arg("grad_K_out"), py::arg("grad_Q_out"),
+          py::arg("K"), py::arg("Q"));
 }

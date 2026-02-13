@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Compatibility wrapper. Prefer: python -m cdssm.eval"""
 
 from cdssm.eval import main

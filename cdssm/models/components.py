@@ -1,11 +1,10 @@
-"""Adaptive components for SC-CDSSM (Self-Calibrating CDSSM).
+"""Adaptive components for CDSSM.
 
-This module provides the adaptive components that eliminate manually tuned
-hyperparameters while preserving A-stability guarantees:
-- AdaptiveTimestep: dt = c / (alpha + |omega|) for scale-invariant dynamics
-- Conv1dSiLU: Fused depthwise conv1d + SiLU using CUDA kernel (kernel_size=4)
+This module provides the adaptive components with all constants derived
+from the CDSSMConfig (no hardcoded magic numbers):
+- Conv1dSiLU: Fused depthwise conv1d + SiLU using CUDA kernel
 - compute_variance_preserving_std: T-Fixup style initialization
-- apply_spectral_init: Data-driven spectral initialization
+- apply_spectral_init: Layer-stratified spectral initialization
 """
 
 import math
@@ -13,17 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from cdssm.ops import conv1d_silu_cuda, adaptive_dt_cuda
-
-
-def bf16_safety_constants(dtype: torch.dtype) -> tuple[float, float, float]:
-    """Derive smooth safety cap constants from dtype mantissa precision."""
-    eps = torch.finfo(dtype).eps
-    omega_thresh = math.sqrt(eps)
-    delta = 16.0 * eps
-    smoothness = omega_thresh / 5.0
-    return omega_thresh, delta, smoothness
-
+from cdssm.ops import conv1d_silu_cuda
 
 
 # Variance-Preserving Initialization (T-Fixup style)
@@ -33,7 +22,13 @@ def compute_variance_preserving_std(
     d_inner: int,
     n_layers: int,
 ) -> dict:
-    """Compute theoretically optimal initialization std for each weight group."""
+    """Compute theoretically optimal initialization std for each weight group.
+
+    T-Fixup depth scaling: projection weights scale as 1/sqrt(2*n_layers),
+    dynamics projections as 1/sqrt(n_layers). Conv and Q_proj use dedicated
+    initialization schemes (Kaiming and identity respectively) in their own
+    init methods rather than this dict.
+    """
     # Base std from Xavier
     base_std_in = math.sqrt(2.0 / (d_model + d_inner))
     base_std_inner = math.sqrt(2.0 / (d_inner + d_inner))
@@ -48,42 +43,10 @@ def compute_variance_preserving_std(
     return {
         "embedding": math.sqrt(1.0 / d_model),
         "in_proj": base_std_in * layer_scale,
-        "conv": 1.0 / math.sqrt(4),  # 1/sqrt(kernel_size) for kernel_size=4
         "dynamics_proj": base_std_inner * layer_scale * dyn_scale,
-        "Q_proj": 1.0,  # Identity-like, handled separately
         "out_proj": base_std_in * layer_scale,
     }
 
-
-# AdaptiveTimestep - Natural Frequency Normalization
-
-class AdaptiveTimestep(nn.Module):
-    """Computes dt adaptively: dt = c / (alpha + |omega| + eps)."""
-
-    def __init__(self, n_heads: int, dtype: torch.dtype = torch.bfloat16):
-        super().__init__()
-        self.n_heads = n_heads
-
-        # Derive safety cap constants from dtype precision
-        omega_thresh, delta, smoothness = bf16_safety_constants(dtype)
-        self.register_buffer("_omega_thresh", torch.tensor(omega_thresh), persistent=False)
-        self.register_buffer("_delta", torch.tensor(delta), persistent=False)
-        self.register_buffer("_smoothness", torch.tensor(smoothness), persistent=False)
-
-        # Dtype-aware epsilon
-        self._eps = torch.finfo(dtype).eps * 100
-
-        # Learnable per-head scale factor (log-space for positivity)
-        # Initialize to log(1) = 0, so softplus gives ~0.69
-        self.log_dt_scale = nn.Parameter(torch.zeros(n_heads))
-
-    def forward(self, alpha: Tensor, omega: Tensor) -> Tensor:
-        """Compute adaptive dt from dynamics (fused CUDA kernel)."""
-        return adaptive_dt_cuda(
-            alpha, omega, self.log_dt_scale.float(),
-            self._omega_thresh.item(), self._delta.item(),
-            self._smoothness.item(), self._eps,
-        )
 
 
 # Conv1dSiLU - Fused Depthwise Conv1d + SiLU using CUDA kernel
@@ -91,13 +54,13 @@ class AdaptiveTimestep(nn.Module):
 class Conv1dSiLU(nn.Module):
     """Depthwise Conv1d + SiLU using CUDA kernel."""
 
-    def __init__(self, d_inner: int):
+    def __init__(self, d_inner: int, kernel_size: int = 4):
         super().__init__()
         self.d_inner = d_inner
-        self.kernel_size = 4
+        self.kernel_size = kernel_size
 
         # Depthwise conv weights: (d_inner, 1, kernel_size)
-        self.weight = nn.Parameter(torch.empty(d_inner, 1, 4))
+        self.weight = nn.Parameter(torch.empty(d_inner, 1, kernel_size))
         self.bias = nn.Parameter(torch.zeros(d_inner))
         self._init_weights()
 
@@ -115,21 +78,32 @@ class Conv1dSiLU(nn.Module):
 
 def apply_spectral_init(
     block: nn.Module,
-    n_heads: int,
+    config,
     layer_idx: int,
-    n_layers: int,
-    context_length: int = 8192,
 ) -> Tensor:
     """Apply layer-stratified log-spaced spectral initialization.
 
     Early layers receive high-frequency (short timescale) priors for local
     pattern matching. Deep layers receive low-frequency (long timescale)
-    priors for document-level coherence. Each layer covers an overlapping
-    50% band of the total log-timescale range, sliding with depth.
+    priors for document-level coherence. Band fraction is derived from
+    n_layers: fraction = 2/(n_layers+1) gives exactly 50% overlap between
+    adjacent layers.
+
+    Args:
+        block: CDSSMBlock module with gate_proj attribute.
+        config: CDSSMConfig with n_heads, n_layers, context_length,
+            spectral_band_fraction, eps_log_argument.
+        layer_idx: Layer index (0-based).
 
     Returns:
         tau: (n_heads,) per-head timescales for EMA decay derivation.
     """
+    n_heads = config.n_heads
+    n_layers = config.n_layers
+    context_length = config.context_length
+    band_fraction = config.spectral_band_fraction
+    eps_log = config.eps_log_argument
+
     # Universal Bounds
     t_min = 1.0
     t_max = float(context_length)
@@ -140,7 +114,7 @@ def apply_spectral_init(
 
     # Layer-dependent band: slides from short to long timescales with depth
     layer_frac = layer_idx / max(n_layers - 1, 1)  # 0.0 to 1.0
-    band_width = 0.5 * log_range  # each layer sees 50% of full range
+    band_width = band_fraction * log_range
     band_start = log_t_min + layer_frac * (log_range - band_width)
     band_end = band_start + band_width
 
@@ -153,23 +127,23 @@ def apply_spectral_init(
         alpha_init = 1.0 / tau
 
         # Inverse softplus to get bias: softplus(x) = log(1 + exp(x))
-        # x = log(exp(alpha) - 1)
-        alpha_biases = torch.log(torch.exp(alpha_init) - 1 + 1e-6)
+        # x = log(exp(alpha) - 1). eps_log prevents log(0).
+        alpha_biases = torch.log(torch.exp(alpha_init) - 1 + eps_log)
 
         # Frequencies inversely track timescales within the band
         freq_min_layer = 1.0 / math.exp(band_end)
-        freq_max_layer = min(0.5, 1.0 / math.exp(band_start))
+        freq_max_layer = min(0.5, 1.0 / math.exp(band_start))  # Nyquist = 0.5 (Shannon)
         log_freqs = torch.linspace(
-            math.log(max(freq_min_layer, 1e-8)),
+            math.log(max(freq_min_layer, eps_log)),
             math.log(freq_max_layer),
             n_heads,
         )
         omega_init = torch.exp(log_freqs)
 
-        # Initialize dynamics_proj bias
+        # Initialize gate_proj bias (alpha and omega segments)
         h = n_heads
-        block.dynamics_proj.bias[:h].copy_(alpha_biases)
-        block.dynamics_proj.bias[h:2*h].copy_(omega_init)
+        block.gate_proj.bias[:h].copy_(alpha_biases)
+        block.gate_proj.bias[h:2*h].copy_(omega_init)
 
     return tau
 
@@ -177,9 +151,14 @@ def apply_spectral_init(
 # RMSNorm - Root Mean Square Layer Normalization
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization."""
+    """Root Mean Square Layer Normalization.
 
-    def __init__(self, d_model: int, eps: float = 1e-5):
+    Args:
+        eps: Normalization epsilon. Default derived from io_eps² (BF16 gradient
+            representability constraint: rsqrt gradient O(eps^{-1/2}) < 1/io_eps).
+    """
+
+    def __init__(self, d_model: int, eps: float = 6.103515625e-05):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(d_model))

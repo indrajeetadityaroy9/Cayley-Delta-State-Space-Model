@@ -1,5 +1,3 @@
 dataset_name: wikitext
 dataset_config: wikitext-103-raw-v1
 context_length: 1024
-num_workers: 4
-prefetch_factor: 4

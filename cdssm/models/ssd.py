@@ -12,12 +12,10 @@ Algorithm:
         Also tracks cumulative base A_bar operators (cum_A) for each chunk.
     3.  Inter-Chunk (Global): Recurrently update state h between chunks using
         the cumulative base transition operators.
-    4.  Combine: Correct local states using the propagated global chunk states.
-
-The delta-rule erasure (step 2) enables selective forgetting of specific
-associations without uniform decay. Inter-chunk correction uses base A_bar
-products (without erasure), which is an acceptable approximation since most
-associations form and are erased within a single chunk of 64 steps.
+    4.  Exact Correction: Propagate inter-chunk states through intra-chunk
+        dynamics (rotation + erasure, no injection) for exact correction.
+        This is possible because the delta-rule dynamics are linear in the
+        initial state h_init.
 
 All scan operations use fused CUDA kernels (csrc/kernels/) for performance.
 """
@@ -30,19 +28,62 @@ from torch import Tensor
 
 from cdssm.ops import intra_chunk_scan_cuda, inter_chunk_scan_cuda
 
-# Constants for chunking
-CHUNK_SIZE = 64  # = head_dim, aligned to H100 Tensor Core width
-
 
 class SSDChunkwiseScan(nn.Module):
     """Chunkwise Parallel Scan for CDSSM with delta-rule state updates."""
 
-    def __init__(self, d_inner: int, n_heads: int, chunk_size: int = CHUNK_SIZE):
+    def __init__(self, d_inner: int, n_heads: int, chunk_size: int):
         super().__init__()
         self.chunk_size = chunk_size
-        self.d_inner = d_inner
-        self.n_heads = n_heads
-        self.head_dim = d_inner // n_heads
+
+    @staticmethod
+    def _exact_correction_scan(
+        A_chunk: Tensor,
+        K_chunk: Tensor,
+        beta_chunk: Tensor,
+        chunk_states: Tensor,
+    ) -> Tensor:
+        """Propagate chunk initial states through dynamics with erasure (no injection).
+
+        Since the delta-rule dynamics h[t] = A[t] @ (h[t-1] - beta*outer(h@k, k)) + beta*outer(v,k)
+        are LINEAR in h (for fixed A, k, beta), superposition holds:
+            h(h_init) = h(0) + Phi(t) @ h_init
+        where Phi is the state transition matrix including both rotation AND erasure.
+
+        This computes Phi(t) @ h_init exactly by running the dynamics with V=0,
+        replacing the approximate correction einsum(cum_A, chunk_states) which
+        ignores delta-rule erasure terms.
+
+        Args:
+            A_chunk:      (B, NC, C, H, 2, 2) - transition matrices per position
+            K_chunk:      (B, NC, C, H, D)     - normalized keys per position
+            beta_chunk:   (B, NC, C, H)        - delta-rule gates per position
+            chunk_states: (B, NC, H, 2, D)     - initial state for each chunk
+
+        Returns:
+            corrections:  (B, NC, C, H, 2, D)  - exact correction at each position
+        """
+        B, NC, C, H = beta_chunk.shape
+
+        # Work in float32 for numerical accuracy
+        h = chunk_states.float().clone()  # (B, NC, H, 2, D)
+
+        corrections = []
+        for t in range(C):  # Only 64 iterations, vectorized over B, NC, H, D
+            a = A_chunk[:, :, t].float()       # (B, NC, H, 2, 2)
+            k = K_chunk[:, :, t].float()       # (B, NC, H, D)
+            b = beta_chunk[:, :, t].float()    # (B, NC, H)
+
+            # 1. Erasure: h -= beta * outer(h @ k, k)
+            kTh = torch.einsum('bnhsd,bnhd->bnhs', h, k)  # (B, NC, H, 2)
+            h = h - b[..., None, None] * torch.einsum('bnhs,bnhd->bnhsd', kTh, k)
+
+            # 2. Rotation: h = A @ h
+            h = torch.einsum('bnhij,bnhjd->bnhid', a, h)
+
+            corrections.append(h.unsqueeze(2))  # (B, NC, 1, H, 2, D)
+
+        return torch.cat(corrections, dim=2).to(A_chunk.dtype)  # (B, NC, C, H, 2, D)
 
     def forward(
         self,
@@ -101,10 +142,12 @@ class SSDChunkwiseScan(nn.Module):
         # === 3. Inter-Chunk Recurrence (CUDA Kernel) ===
         chunk_states = inter_chunk_scan_cuda(total_A, final_local_h)
 
-        # === 4. Correction (Broadcast) ===
-        # True h_{t} = local_h_{t} + (cum_A_{t} @ chunk_state_{k})
-        # cum_A: (B, NC, C, H, 2, 2), chunk_states: (B, NC, H, 2, D)
-        correction = torch.einsum('bnchij,bnhjd->bnchid', cum_A, chunk_states)
+        # === 4. Exact Correction ===
+        # Propagate chunk_states through intra-chunk dynamics (erasure + rotation)
+        # This is exact because the delta-rule dynamics are linear in h_init
+        correction = self._exact_correction_scan(
+            A_chunk, K_chunk, beta_chunk, chunk_states
+        )
 
         Y = local_h + correction
 
