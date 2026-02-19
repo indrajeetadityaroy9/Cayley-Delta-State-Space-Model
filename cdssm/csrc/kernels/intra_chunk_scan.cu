@@ -1,20 +1,22 @@
-// CDSSM Intra-Chunk Delta-Rule Scan — CUDA Implementation
+// CDSSM v2 Intra-Chunk Delta-Rule Scan — Complex Diagonal State
 //
 // Fuses the sequential delta-rule scan within each chunk into a single kernel.
-// This is the critical performance bottleneck: the Python version issues 5+
-// einsum/matmul calls per timestep × 64 timesteps per chunk.
+// State is now h ∈ R^(N×D) with complex diagonal rotation A_bar ∈ C^(N/2)
+// stored as re/im interleaved pairs (conj(mu)).
 //
 // Algorithm (per chunk, per head):
-//   State h ∈ R^(2×D) is a matrix memory.
+//   State h[N][D] is register-resident (N up to MAX_STATE_DIM=32).
 //   For each timestep t in 0..C-1:
-//     kTh = h @ k           (retrieval: cross-thread reduction over D)
-//     h_mod = h - β*(kTh⊗k) (selective erasure)
-//     h = A @ h_mod          (Cayley rotation-damping, 2×2 broadcast over D)
-//     h += β*(v⊗k)          (injection)
-//   Also tracks cumulative A_bar product (2×2) for inter-chunk correction.
+//     kTh[s] = sum_d(h[s,d] * k[d])   (batched retrieval: 2 syncthreads total)
+//     h[s,d] -= beta * kTh[s] * k[d]  (selective erasure)
+//     Complex diagonal rotation:        (pairs j=0..N/2-1)
+//       h_new[2j]   = re*h[2j]   - im*h[2j+1]
+//       h_new[2j+1] = re*h[2j+1] + im*h[2j]
+//     h[s,d] += beta * v[s] * k[d]    (injection)
+//   Also tracks cumulative A_bar product (complex diagonal) for inter-chunk correction.
 //
-// Grid: (B*NC, H)  — one block per (chunk, head)
-// Block: D threads  — each thread owns column d of the (2,D) state
+// Grid: (BNC, H)  — one block per (chunk, head)
+// Block: D threads — each thread owns column d of the (N,D) state
 //
 // BF16 I/O, FP32 compute. Register-resident state.
 
@@ -23,50 +25,24 @@
 #include <cuda_bf16.h>
 
 #include "../include/common.cuh"
-#include "../include/reduction.cuh"
 
 namespace cdssm {
 
-constexpr int MAX_HEAD_DIM = 128;
-constexpr int MAX_WARPS = MAX_HEAD_DIM / WARP_SIZE;  // 4
-
-// Helper: cross-block reduction for D threads (up to 4 warps)
-// Reduces `val` across all D threads, returns the scalar sum to every thread.
-// Uses shared memory `smem` which must have at least MAX_WARPS floats.
-__device__ __forceinline__ float block_reduce_to_scalar(
-    float val, float* smem, int D
-) {
-    float warp_sum = warp_reduce_sum(val);
-    int warp_id = threadIdx.x / WARP_SIZE;
-    int lane_id = threadIdx.x % WARP_SIZE;
-    int num_warps = (D + WARP_SIZE - 1) / WARP_SIZE;
-
-    if (lane_id == 0) {
-        smem[warp_id] = warp_sum;
-    }
-    __syncthreads();
-
-    float total = 0.0f;
-    #pragma unroll
-    for (int w = 0; w < MAX_WARPS; w++) {
-        if (w < num_warps) total += smem[w];
-    }
-    return total;
-}
 
 // Forward Kernel
 
+
 __global__ void intra_chunk_scan_fwd_kernel(
     // Inputs (BF16, contiguous)
-    const __nv_bfloat16* __restrict__ A_flat,     // (BNC, C, H, 2, 2)
+    const __nv_bfloat16* __restrict__ A_flat,     // (BNC, C, H, N) re/im interleaved
     const __nv_bfloat16* __restrict__ K_flat,     // (BNC, C, H, D)
-    const __nv_bfloat16* __restrict__ V_flat,     // (BNC, C, H, 2)
+    const __nv_bfloat16* __restrict__ V_flat,     // (BNC, C, H, N)
     const __nv_bfloat16* __restrict__ beta_flat,  // (BNC, C, H)
     // Outputs (BF16)
-    __nv_bfloat16* __restrict__ local_h,          // (BNC, C, H, 2, D)
-    __nv_bfloat16* __restrict__ cum_A,            // (BNC, C, H, 2, 2)
+    __nv_bfloat16* __restrict__ local_h,          // (BNC, C, H, N, D)
+    __nv_bfloat16* __restrict__ cum_A,            // (BNC, C, H, N)
     // Dimensions
-    int BNC, int C, int H, int D
+    int BNC, int C, int H, int D, int N
 ) {
     const int chunk_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
@@ -75,150 +51,185 @@ __global__ void intra_chunk_scan_fwd_kernel(
     const int d = threadIdx.x;
     if (d >= D) return;
 
-    // Shared memory for cross-warp reductions (2 values: kTh_0, kTh_1)
-    __shared__ float smem[MAX_WARPS];
+    // Shared memory for batched kTh reduction
+    __shared__ float smem[MAX_WARPS * MAX_STATE_DIM];
+
+    const int warp_id  = d / WARP_SIZE;
+    const int lane_id  = d % WARP_SIZE;
+    const int num_warps = (D + WARP_SIZE - 1) / WARP_SIZE;
 
     // Stride computations for contiguous tensors
-    // A_flat: (BNC, C, H, 2, 2) → innermost dims are [2,2] = 4 elements
-    const int A_base = (chunk_idx * C * H + head_idx) * 4;
-    const int A_step = H * 4;  // stride along C dimension
+    // A_flat: (BNC, C, H, N)
+    const int A_base = (chunk_idx * C * H + head_idx) * N;
+    const int A_step = H * N;
 
     // K_flat: (BNC, C, H, D)
     const int K_base = (chunk_idx * C * H + head_idx) * D;
     const int K_step = H * D;
 
-    // V_flat: (BNC, C, H, 2)
-    const int V_base = (chunk_idx * C * H + head_idx) * 2;
-    const int V_step = H * 2;
+    // V_flat: (BNC, C, H, N)
+    const int V_base = (chunk_idx * C * H + head_idx) * N;
+    const int V_step = H * N;
 
     // beta_flat: (BNC, C, H)
     const int b_base = chunk_idx * C * H + head_idx;
     const int b_step = H;
 
-    // local_h: (BNC, C, H, 2, D) → innermost [2,D] = 2*D elements
-    const int lh_base = (chunk_idx * C * H + head_idx) * 2 * D;
-    const int lh_step = H * 2 * D;
+    // local_h: (BNC, C, H, N, D)
+    const int lh_base = (chunk_idx * C * H + head_idx) * N * D;
+    const int lh_step = H * N * D;
 
-    // cum_A: (BNC, C, H, 2, 2) → innermost [2,2] = 4 elements
-    const int cA_base = (chunk_idx * C * H + head_idx) * 4;
-    const int cA_step = H * 4;
+    // cum_A: (BNC, C, H, N)
+    const int cA_base = (chunk_idx * C * H + head_idx) * N;
+    const int cA_step = H * N;
 
-    // Register-resident state
-    float h0 = 0.0f, h1 = 0.0f;
+    // Register-resident state: h[N]
+    float h[MAX_STATE_DIM];
+    #pragma unroll
+    for (int s = 0; s < MAX_STATE_DIM; s++) h[s] = 0.0f;
 
-    // Cumulative A_bar product (identity)
-    float cA00 = 1.0f, cA01 = 0.0f;
-    float cA10 = 0.0f, cA11 = 1.0f;
+    // Cumulative A_bar product (complex diagonal, identity init)
+    // Re/im interleaved: cA[2j]=re, cA[2j+1]=im
+    float cA[MAX_STATE_DIM];
+    #pragma unroll
+    for (int s = 0; s < MAX_STATE_DIM; s += 2) {
+        cA[s]     = 1.0f;  // re = 1
+        cA[s + 1] = 0.0f;  // im = 0
+    }
 
     for (int t = 0; t < C; t++) {
         // Load A_bar[t] (shared: same for all threads)
         int Ai = A_base + t * A_step;
-        float a11 = bf16_to_fp32(__ldg(&A_flat[Ai + 0]));
-        float a12 = bf16_to_fp32(__ldg(&A_flat[Ai + 1]));
-        float a21 = bf16_to_fp32(__ldg(&A_flat[Ai + 2]));
-        float a22 = bf16_to_fp32(__ldg(&A_flat[Ai + 3]));
+        float a[MAX_STATE_DIM];
+        for (int s = 0; s < N; s++) {
+            a[s] = bf16_to_fp32(__ldg(&A_flat[Ai + s]));
+        }
 
-        // Load k[t,d] (per-thread), v[t], beta[t] (shared)
+        // Load k[t,d] (per-thread), v[t] (shared), beta[t] (shared)
         float k_d  = bf16_to_fp32(__ldg(&K_flat[K_base + t * K_step + d]));
         int Vi = V_base + t * V_step;
-        float v0   = bf16_to_fp32(__ldg(&V_flat[Vi + 0]));
-        float v1   = bf16_to_fp32(__ldg(&V_flat[Vi + 1]));
+        float v[MAX_STATE_DIM];
+        for (int s = 0; s < N; s++) {
+            v[s] = bf16_to_fp32(__ldg(&V_flat[Vi + s]));
+        }
         float beta = bf16_to_fp32(__ldg(&beta_flat[b_base + t * b_step]));
 
-        // 1. Delta-rule retrieval: kTh_s = sum_d(h[s,d] * k[d])
-        float kTh_0 = block_reduce_to_scalar(h0 * k_d, smem, D);
+        // 1. Delta-rule retrieval: kTh[s] = sum_d(h[s,d] * k[d])
+        //    Batched reduction: amortize to 2 syncthreads total
+        float kTh_local[MAX_STATE_DIM];
+        for (int s = 0; s < N; s++) {
+            kTh_local[s] = h[s] * k_d;
+        }
+        // Warp-level reduction
+        for (int s = 0; s < N; s++) {
+            kTh_local[s] = warp_reduce_sum(kTh_local[s]);
+        }
+        // Write warp results to shared memory
+        if (lane_id == 0) {
+            for (int s = 0; s < N; s++) {
+                smem[warp_id * MAX_STATE_DIM + s] = kTh_local[s];
+            }
+        }
         __syncthreads();
-        float kTh_1 = block_reduce_to_scalar(h1 * k_d, smem, D);
+
+        // Cross-warp reduction
+        float kTh[MAX_STATE_DIM];
+        for (int s = 0; s < N; s++) {
+            kTh[s] = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < MAX_WARPS; w++) {
+                if (w < num_warps) kTh[s] += smem[w * MAX_STATE_DIM + s];
+            }
+        }
         __syncthreads();
 
         // 2. Selective erasure
-        h0 -= beta * kTh_0 * k_d;
-        h1 -= beta * kTh_1 * k_d;
+        for (int s = 0; s < N; s++) {
+            h[s] -= beta * kTh[s] * k_d;
+        }
 
-        // 3. Apply A_bar rotation-damping (2×2 @ 2-vector, broadcast over D)
-        float h0_new = a11 * h0 + a12 * h1;
-        float h1_new = a21 * h0 + a22 * h1;
-        h0 = h0_new;
-        h1 = h1_new;
+        // 3. Complex diagonal rotation (pairs j=0..N/2-1)
+        //    A_bar stores conj(mu): re/im interleaved
+        //    h_new[2j]   = re*h[2j]   - im*h[2j+1]
+        //    h_new[2j+1] = re*h[2j+1] + im*h[2j]
+        for (int j = 0; j < N / 2; j++) {
+            float re = a[2 * j];
+            float im = a[2 * j + 1];
+            float h_re = h[2 * j];
+            float h_im = h[2 * j + 1];
+            h[2 * j]     = re * h_re - im * h_im;
+            h[2 * j + 1] = re * h_im + im * h_re;
+        }
 
         // 4. Injection
-        h0 += beta * v0 * k_d;
-        h1 += beta * v1 * k_d;
+        for (int s = 0; s < N; s++) {
+            h[s] += beta * v[s] * k_d;
+        }
 
         // Store local_h[chunk, t, head, s, d]
         int lhi = lh_base + t * lh_step;
-        local_h[lhi + d]     = fp32_to_bf16(h0);  // s=0
-        local_h[lhi + D + d] = fp32_to_bf16(h1);  // s=1
+        for (int s = 0; s < N; s++) {
+            local_h[lhi + s * D + d] = fp32_to_bf16(h[s]);
+        }
 
-        // Update cumulative A_bar product: cumA = A[t] @ cumA
-        float new00 = a11 * cA00 + a12 * cA10;
-        float new01 = a11 * cA01 + a12 * cA11;
-        float new10 = a21 * cA00 + a22 * cA10;
-        float new11 = a21 * cA01 + a22 * cA11;
-        cA00 = new00; cA01 = new01;
-        cA10 = new10; cA11 = new11;
+        // 5. Update cumulative A_bar product: cum_A = A[t] * cum_A (complex diagonal)
+        //    For each pair j:
+        //      new_re = a_re * cA_re - a_im * cA_im
+        //      new_im = a_re * cA_im + a_im * cA_re
+        for (int j = 0; j < N / 2; j++) {
+            float a_re = a[2 * j];
+            float a_im = a[2 * j + 1];
+            float c_re = cA[2 * j];
+            float c_im = cA[2 * j + 1];
+            cA[2 * j]     = a_re * c_re - a_im * c_im;
+            cA[2 * j + 1] = a_re * c_im + a_im * c_re;
+        }
 
-        // Store cum_A[chunk, t, head, :, :] — only thread 0 writes
+        // Store cum_A[chunk, t, head, :] — only thread 0 writes
         if (d == 0) {
             int cAi = cA_base + t * cA_step;
-            cum_A[cAi + 0] = fp32_to_bf16(cA00);
-            cum_A[cAi + 1] = fp32_to_bf16(cA01);
-            cum_A[cAi + 2] = fp32_to_bf16(cA10);
-            cum_A[cAi + 3] = fp32_to_bf16(cA11);
+            for (int s = 0; s < N; s++) {
+                cum_A[cAi + s] = fp32_to_bf16(cA[s]);
+            }
         }
     }
 }
 
+
 // Backward Kernel
+
 //
 // Reverse-mode sequential scan through the chunk.
 //
 // Forward step t:
 //   h_prev = state entering step t (= local_h[t-1], or 0 for t=0)
 //   kTh[s] = sum_d(h_prev[s,d] * k[d])
-//   h_mod[s,d] = h_prev[s,d] - beta * kTh[s] * k[d]
-//   h_evolved[s,d] = A[s,0]*h_mod[0,d] + A[s,1]*h_mod[1,d]
-//   h_out[s,d] = h_evolved[s,d] + beta * v[s] * k[d]
-//   local_h[t] = h_out
+//   h_mod[s,d] = h_prev[s,d] - beta * kTh[s] * k[d]           (erasure)
+//   Complex diagonal rotation:
+//     h_evolved[2j,d]   = re*h_mod[2j,d]   - im*h_mod[2j+1,d]
+//     h_evolved[2j+1,d] = re*h_mod[2j+1,d] + im*h_mod[2j,d]
+//   h_out[s,d] = h_evolved[s,d] + beta * v[s] * k[d]          (injection)
 //
-// Backward: propagate dh (gradient of loss w.r.t. state) in reverse.
-//
-// At step t, dh = dL/d(h_out[t]) = grad_local_h[t] + dh_from_step_{t+1}
-//
-// Derivatives w.r.t. inputs at step t:
-//   d/dv[s]: sum_d(beta * k[d] * dh[s,d])
-//   d/dk[d] from inject: beta * (v[0]*dh[0,d] + v[1]*dh[1,d])
-//   d/dbeta from inject: sum_{s,d}(v[s]*k[d]*dh[s,d])
-//
-//   dh_mod[s,d] = A[0,s]*dh[0,d] + A[1,s]*dh[1,d]  (A^T @ dh)
-//   d/dA[i,j] from rotation: sum_d(dh[i,d] * h_mod[j,d])
-//
-//   zeta[s] = sum_d(dh_mod[s,d] * k[d])
-//   d/dk[d] from erase: -beta * (kTh[0]*dh_mod[0,d] + kTh[1]*dh_mod[1,d])
-//                       -beta * (h_prev[0,d]*zeta[0] + h_prev[1,d]*zeta[1])
-//   d/dbeta from erase: -sum_{s,d}(kTh[s]*k[d]*dh_mod[s,d])
-//                      = -(kTh[0]*zeta[0] + kTh[1]*zeta[1])
-//
-//   dh_prev[s,d] = dh_mod[s,d] - beta * zeta[s] * k[d]
+// Backward: propagate dh (gradient w.r.t. state) in reverse.
 
 __global__ void intra_chunk_scan_bwd_kernel(
     // Upstream gradients
-    const __nv_bfloat16* __restrict__ grad_local_h,  // (BNC, C, H, 2, D)
-    const __nv_bfloat16* __restrict__ grad_cum_A,    // (BNC, C, H, 2, 2)
+    const __nv_bfloat16* __restrict__ grad_local_h,  // (BNC, C, H, N, D)
+    const __nv_bfloat16* __restrict__ grad_cum_A,    // (BNC, C, H, N)
     // Saved from forward
-    const __nv_bfloat16* __restrict__ A_flat,        // (BNC, C, H, 2, 2)
+    const __nv_bfloat16* __restrict__ A_flat,        // (BNC, C, H, N)
     const __nv_bfloat16* __restrict__ K_flat,        // (BNC, C, H, D)
-    const __nv_bfloat16* __restrict__ V_flat,        // (BNC, C, H, 2)
+    const __nv_bfloat16* __restrict__ V_flat,        // (BNC, C, H, N)
     const __nv_bfloat16* __restrict__ beta_flat,     // (BNC, C, H)
-    const __nv_bfloat16* __restrict__ local_h,       // (BNC, C, H, 2, D)
-    const __nv_bfloat16* __restrict__ cum_A,         // (BNC, C, H, 2, 2)
+    const __nv_bfloat16* __restrict__ local_h,       // (BNC, C, H, N, D)
+    const __nv_bfloat16* __restrict__ cum_A,         // (BNC, C, H, N)
     // Output gradients
-    __nv_bfloat16* __restrict__ grad_A,              // (BNC, C, H, 2, 2)
+    __nv_bfloat16* __restrict__ grad_A,              // (BNC, C, H, N)
     __nv_bfloat16* __restrict__ grad_K,              // (BNC, C, H, D)
-    __nv_bfloat16* __restrict__ grad_V,              // (BNC, C, H, 2)
+    __nv_bfloat16* __restrict__ grad_V,              // (BNC, C, H, N)
     float* __restrict__ grad_beta,                    // (BNC, C, H) FP32
     // Dimensions
-    int BNC, int C, int H, int D
+    int BNC, int C, int H, int D, int N
 ) {
     const int chunk_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
@@ -227,173 +238,304 @@ __global__ void intra_chunk_scan_bwd_kernel(
     const int d = threadIdx.x;
     if (d >= D) return;
 
-    __shared__ float smem[MAX_WARPS];
+    __shared__ float smem[MAX_WARPS * MAX_STATE_DIM];
+
+    const int warp_id  = d / WARP_SIZE;
+    const int lane_id  = d % WARP_SIZE;
+    const int num_warps = (D + WARP_SIZE - 1) / WARP_SIZE;
 
     // Strides (same layout as forward)
-    const int A_base  = (chunk_idx * C * H + head_idx) * 4;
-    const int A_step  = H * 4;
+    const int A_base  = (chunk_idx * C * H + head_idx) * N;
+    const int A_step  = H * N;
     const int K_base  = (chunk_idx * C * H + head_idx) * D;
     const int K_step  = H * D;
-    const int V_base  = (chunk_idx * C * H + head_idx) * 2;
-    const int V_step  = H * 2;
+    const int V_base  = (chunk_idx * C * H + head_idx) * N;
+    const int V_step  = H * N;
     const int b_base  = chunk_idx * C * H + head_idx;
     const int b_step  = H;
-    const int lh_base = (chunk_idx * C * H + head_idx) * 2 * D;
-    const int lh_step = H * 2 * D;
-    const int cA_base = (chunk_idx * C * H + head_idx) * 4;
-    const int cA_step = H * 4;
+    const int lh_base = (chunk_idx * C * H + head_idx) * N * D;
+    const int lh_step = H * N * D;
+    const int cA_base = (chunk_idx * C * H + head_idx) * N;
+    const int cA_step = H * N;
 
     // ---- State gradient accumulator ----
-    float dh0 = 0.0f, dh1 = 0.0f;
+    float dh[MAX_STATE_DIM];
+    #pragma unroll
+    for (int s = 0; s < MAX_STATE_DIM; s++) dh[s] = 0.0f;
 
-    // ---- CumA gradient accumulator (2x2, register-only) ----
-    // cumA[t] = A[t] @ cumA[t-1], cumA[-1] = I
-    // Backward: dcumA_accum[t] = grad_cum_A[t] + A[t+1]^T @ dcumA_accum[t+1]
-    // grad_A[t] from cumA path = dcumA_accum[t] @ cumA[t-1]^T
-    float dcA00 = 0.0f, dcA01 = 0.0f;
-    float dcA10 = 0.0f, dcA11 = 0.0f;
+    // ---- CumA gradient accumulator (complex diagonal) ----
+    float dcA[MAX_STATE_DIM];
+    #pragma unroll
+    for (int s = 0; s < MAX_STATE_DIM; s++) dcA[s] = 0.0f;
 
     for (int t = C - 1; t >= 0; t--) {
         // ---- Add upstream gradient from local_h[t] ----
         int lhi = lh_base + t * lh_step;
-        dh0 += bf16_to_fp32(__ldg(&grad_local_h[lhi + d]));
-        dh1 += bf16_to_fp32(__ldg(&grad_local_h[lhi + D + d]));
+        for (int s = 0; s < N; s++) {
+            dh[s] += bf16_to_fp32(__ldg(&grad_local_h[lhi + s * D + d]));
+        }
 
         // ---- Load forward values ----
         int Ai = A_base + t * A_step;
-        float a11 = bf16_to_fp32(__ldg(&A_flat[Ai + 0]));
-        float a12 = bf16_to_fp32(__ldg(&A_flat[Ai + 1]));
-        float a21 = bf16_to_fp32(__ldg(&A_flat[Ai + 2]));
-        float a22 = bf16_to_fp32(__ldg(&A_flat[Ai + 3]));
+        float a[MAX_STATE_DIM];
+        for (int s = 0; s < N; s++) {
+            a[s] = bf16_to_fp32(__ldg(&A_flat[Ai + s]));
+        }
 
         float k_d  = bf16_to_fp32(__ldg(&K_flat[K_base + t * K_step + d]));
         int Vi = V_base + t * V_step;
-        float v0   = bf16_to_fp32(__ldg(&V_flat[Vi + 0]));
-        float v1   = bf16_to_fp32(__ldg(&V_flat[Vi + 1]));
+        float v[MAX_STATE_DIM];
+        for (int s = 0; s < N; s++) {
+            v[s] = bf16_to_fp32(__ldg(&V_flat[Vi + s]));
+        }
         float beta = bf16_to_fp32(__ldg(&beta_flat[b_base + t * b_step]));
 
         // h_prev[s,d] = local_h[t-1, s, d], or 0 if t=0
-        float hp0, hp1;
+        float hp[MAX_STATE_DIM];
         if (t > 0) {
             int prev_i = lh_base + (t - 1) * lh_step;
-            hp0 = bf16_to_fp32(__ldg(&local_h[prev_i + d]));
-            hp1 = bf16_to_fp32(__ldg(&local_h[prev_i + D + d]));
+            for (int s = 0; s < N; s++) {
+                hp[s] = bf16_to_fp32(__ldg(&local_h[prev_i + s * D + d]));
+            }
         } else {
-            hp0 = 0.0f;
-            hp1 = 0.0f;
+            for (int s = 0; s < N; s++) hp[s] = 0.0f;
         }
 
-        // ---- Recompute kTh = h_prev @ k ----
-        float kTh_0 = block_reduce_to_scalar(hp0 * k_d, smem, D);
+        // ---- Recompute kTh = h_prev @ k (batched reduction) ----
+        float kTh_local[MAX_STATE_DIM];
+        for (int s = 0; s < N; s++) kTh_local[s] = hp[s] * k_d;
+        for (int s = 0; s < N; s++) kTh_local[s] = warp_reduce_sum(kTh_local[s]);
+        if (lane_id == 0) {
+            for (int s = 0; s < N; s++) smem[warp_id * MAX_STATE_DIM + s] = kTh_local[s];
+        }
         __syncthreads();
-        float kTh_1 = block_reduce_to_scalar(hp1 * k_d, smem, D);
+        float kTh[MAX_STATE_DIM];
+        for (int s = 0; s < N; s++) {
+            kTh[s] = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < MAX_WARPS; w++) {
+                if (w < num_warps) kTh[s] += smem[w * MAX_STATE_DIM + s];
+            }
+        }
         __syncthreads();
 
         // ---- Recompute h_mod = h_prev - beta * (kTh outer k) ----
-        float hm0 = hp0 - beta * kTh_0 * k_d;
-        float hm1 = hp1 - beta * kTh_1 * k_d;
+        float hm[MAX_STATE_DIM];
+        for (int s = 0; s < N; s++) {
+            hm[s] = hp[s] - beta * kTh[s] * k_d;
+        }
 
-        // 4. Backward through injection: h_out = h_evolved + beta*(v⊗k)
-        // dh is the gradient w.r.t. h_out
-        // grad_v: sum_d(beta * k_d * dh[s,d])
-        float gv0 = block_reduce_to_scalar(beta * k_d * dh0, smem, D);
+        
+        // Backward through injection: h_out = h_evolved + beta*(v outer k)
+        // dh is gradient w.r.t. h_out
+        
+
+        // grad_v[s]: sum_d(beta * k_d * dh[s,d]) — batched reduction
+        float gv_local[MAX_STATE_DIM];
+        for (int s = 0; s < N; s++) gv_local[s] = beta * k_d * dh[s];
+        for (int s = 0; s < N; s++) gv_local[s] = warp_reduce_sum(gv_local[s]);
+        if (lane_id == 0) {
+            for (int s = 0; s < N; s++) smem[warp_id * MAX_STATE_DIM + s] = gv_local[s];
+        }
         __syncthreads();
-        float gv1 = block_reduce_to_scalar(beta * k_d * dh1, smem, D);
+        float gv[MAX_STATE_DIM];
+        for (int s = 0; s < N; s++) {
+            gv[s] = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < MAX_WARPS; w++) {
+                if (w < num_warps) gv[s] += smem[w * MAX_STATE_DIM + s];
+            }
+        }
         __syncthreads();
 
-        // grad_k from injection (per-thread)
-        float gk_inject = beta * (v0 * dh0 + v1 * dh1);
+        // grad_k from injection (per-thread): beta * sum_s(v[s]*dh[s,d])
+        float gk_inject = 0.0f;
+        for (int s = 0; s < N; s++) {
+            gk_inject += v[s] * dh[s];
+        }
+        gk_inject *= beta;
 
-        // grad_beta from injection: sum_{s,d}(v[s]*k[d]*dh[s,d])
-        float gbeta_inject = block_reduce_to_scalar(
-            v0 * k_d * dh0 + v1 * k_d * dh1, smem, D);
+        // grad_beta from injection: sum_{s,d}(v[s]*k[d]*dh[s,d]) — batched reduction
+        float gbeta_inject_local = 0.0f;
+        for (int s = 0; s < N; s++) {
+            gbeta_inject_local += v[s] * k_d * dh[s];
+        }
+        // Reduce across threads for gbeta
+        float gbeta_inject_warp = warp_reduce_sum(gbeta_inject_local);
+        if (lane_id == 0) smem[warp_id * MAX_STATE_DIM] = gbeta_inject_warp;
+        __syncthreads();
+        float gbeta_inject = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < MAX_WARPS; w++) {
+            if (w < num_warps) gbeta_inject += smem[w * MAX_STATE_DIM];
+        }
         __syncthreads();
 
-        // Store grad_V (thread 0 writes the 2 values)
+        // Store grad_V (thread 0 writes the N values)
         if (d == 0) {
             int gVi = V_base + t * V_step;
-            grad_V[gVi + 0] = fp32_to_bf16(gv0);
-            grad_V[gVi + 1] = fp32_to_bf16(gv1);
+            for (int s = 0; s < N; s++) {
+                grad_V[gVi + s] = fp32_to_bf16(gv[s]);
+            }
         }
 
-        // 3. Backward through rotation: h_evolved = A @ h_mod
-        // dh_mod = A^T @ dh  (dh is still the gradient at h_out = h_evolved here,
-        //   since injection doesn't modify h_evolved's gradient contribution)
-        float dhm0 = a11 * dh0 + a21 * dh1;  // A^T row 0
-        float dhm1 = a12 * dh0 + a22 * dh1;  // A^T row 1
+        
+        // Backward through rotation: complex diagonal
+        //   Forward: h_evolved[2j]   = re*h_mod[2j]   - im*h_mod[2j+1]
+        //            h_evolved[2j+1] = re*h_mod[2j+1] + im*h_mod[2j]
+        //   A_bar stores conj(mu) = (re, im)
+        //
+        //   Backward through rotation to get dhm:
+        //     Multiply grad by conj of stored conj(mu) = mu = (re, -im):
+        //     dhm[2j]   = re*dh[2j]   + im*dh[2j+1]   (note: +im because conj of conj)
+        //     dhm[2j+1] = re*dh[2j+1] - im*dh[2j]
+        
+        float dhm[MAX_STATE_DIM];
+        for (int j = 0; j < N / 2; j++) {
+            float re = a[2 * j];
+            float im = a[2 * j + 1];
+            float dh_re = dh[2 * j];
+            float dh_im = dh[2 * j + 1];
+            dhm[2 * j]     = re * dh_re + im * dh_im;
+            dhm[2 * j + 1] = re * dh_im - im * dh_re;
+        }
 
-        // grad_A: dh[i,d] * h_mod[j,d] → sum over D
-        float gA00 = block_reduce_to_scalar(dh0 * hm0, smem, D);
+        
+        // grad_A from state path (needs cross-thread reduction)
+        //   Forward: h_evolved = stored * h_mod (complex multiply per pair)
+        //     h_evolved_re = stored_re * hm_re - stored_im * hm_im
+        //     h_evolved_im = stored_re * hm_im + stored_im * hm_re
+        //   d/d(stored_re) = dh_re * hm_re + dh_im * hm_im  (summed over D)
+        //   d/d(stored_im) = -dh_re * hm_im + dh_im * hm_re (summed over D)
+        
+        float gA_local[MAX_STATE_DIM];
+        for (int j = 0; j < N / 2; j++) {
+            float hm_re = hm[2 * j];
+            float hm_im = hm[2 * j + 1];
+            float dh_re = dh[2 * j];
+            float dh_im = dh[2 * j + 1];
+            gA_local[2 * j]     = dh_re * hm_re + dh_im * hm_im;   // d/d(stored_re)
+            gA_local[2 * j + 1] = -dh_re * hm_im + dh_im * hm_re;  // d/d(stored_im)
+        }
+        // Batched reduction for grad_A
+        for (int s = 0; s < N; s++) gA_local[s] = warp_reduce_sum(gA_local[s]);
+        if (lane_id == 0) {
+            for (int s = 0; s < N; s++) smem[warp_id * MAX_STATE_DIM + s] = gA_local[s];
+        }
         __syncthreads();
-        float gA01 = block_reduce_to_scalar(dh0 * hm1, smem, D);
-        __syncthreads();
-        float gA10 = block_reduce_to_scalar(dh1 * hm0, smem, D);
-        __syncthreads();
-        float gA11 = block_reduce_to_scalar(dh1 * hm1, smem, D);
+        float gA_state[MAX_STATE_DIM];
+        for (int s = 0; s < N; s++) {
+            gA_state[s] = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < MAX_WARPS; w++) {
+                if (w < num_warps) gA_state[s] += smem[w * MAX_STATE_DIM + s];
+            }
+        }
         __syncthreads();
 
+        
         // CumA gradient path (register-only, no cross-thread reduction)
-        // Accumulate: dcA_accum[t] = grad_cum_A[t] + A[t+1]^T @ dcA_accum[t+1]
-        // (At this point dcA00..11 holds dcA_accum from step t+1, or 0 for t=C-1)
-        // Apply A[t+1]^T to dcA_accum was done at end of previous iteration.
-        // Now add grad_cum_A[t]:
-        int gcAi = cA_base + t * cA_step;
-        dcA00 += bf16_to_fp32(__ldg(&grad_cum_A[gcAi + 0]));
-        dcA01 += bf16_to_fp32(__ldg(&grad_cum_A[gcAi + 1]));
-        dcA10 += bf16_to_fp32(__ldg(&grad_cum_A[gcAi + 2]));
-        dcA11 += bf16_to_fp32(__ldg(&grad_cum_A[gcAi + 3]));
+        //   cum_A[t] = A[t] * cum_A[t-1] (complex element-wise multiply)
+        //   Backward: dcA_accum[t] = grad_cum_A[t] + conj_stored * dcA_accum[t+1]
+        //   (At this point dcA holds dcA_accum from step t+1, already propagated)
+        
 
-        // grad_A[t] from cumA path = dcA_accum[t] @ cumA[t-1]^T
-        // cumA[t-1] is the 2x2 matrix at step t-1
-        float prevCA00, prevCA01, prevCA10, prevCA11;
+        // Add grad_cum_A[t]
+        int gcAi = cA_base + t * cA_step;
+        for (int s = 0; s < N; s++) {
+            dcA[s] += bf16_to_fp32(__ldg(&grad_cum_A[gcAi + s]));
+        }
+
+        // grad_A[t] from cumA path = dcA_accum[t] * conj(cum_A[t-1])
+        // cum_A[t-1] is complex diagonal at step t-1
+        float prevCA[MAX_STATE_DIM];
         if (t > 0) {
             int pcAi = cA_base + (t - 1) * cA_step;
-            prevCA00 = bf16_to_fp32(__ldg(&cum_A[pcAi + 0]));
-            prevCA01 = bf16_to_fp32(__ldg(&cum_A[pcAi + 1]));
-            prevCA10 = bf16_to_fp32(__ldg(&cum_A[pcAi + 2]));
-            prevCA11 = bf16_to_fp32(__ldg(&cum_A[pcAi + 3]));
+            for (int s = 0; s < N; s++) {
+                prevCA[s] = bf16_to_fp32(__ldg(&cum_A[pcAi + s]));
+            }
         } else {
-            // cumA[-1] = I
-            prevCA00 = 1.0f; prevCA01 = 0.0f;
-            prevCA10 = 0.0f; prevCA11 = 1.0f;
+            // cum_A[-1] = identity: re=1, im=0
+            for (int j = 0; j < N / 2; j++) {
+                prevCA[2 * j]     = 1.0f;
+                prevCA[2 * j + 1] = 0.0f;
+            }
         }
 
-        // dcA @ prevCA^T (2x2 @ 2x2^T)
-        float gA_cA00 = dcA00 * prevCA00 + dcA01 * prevCA01;
-        float gA_cA01 = dcA00 * prevCA10 + dcA01 * prevCA11;
-        float gA_cA10 = dcA10 * prevCA00 + dcA11 * prevCA01;
-        float gA_cA11 = dcA10 * prevCA10 + dcA11 * prevCA11;
+        // dcA * conj(prevCA) for each complex pair
+        // conj(prevCA) for pair j: (prevCA_re, -prevCA_im)
+        // (dcA_re + i*dcA_im) * (prevCA_re - i*prevCA_im)
+        //   = dcA_re*prevCA_re + dcA_im*prevCA_im
+        //   + i*(dcA_im*prevCA_re - dcA_re*prevCA_im)
+        float gA_cA[MAX_STATE_DIM];
+        for (int j = 0; j < N / 2; j++) {
+            float dcA_re  = dcA[2 * j];
+            float dcA_im  = dcA[2 * j + 1];
+            float pCA_re  = prevCA[2 * j];
+            float pCA_im  = prevCA[2 * j + 1];
+            gA_cA[2 * j]     = dcA_re * pCA_re + dcA_im * pCA_im;
+            gA_cA[2 * j + 1] = dcA_im * pCA_re - dcA_re * pCA_im;
+        }
 
         // Total grad_A[t] = state-path gradient + cumA-path gradient
         if (d == 0) {
-            grad_A[gcAi + 0] = fp32_to_bf16(gA00 + gA_cA00);
-            grad_A[gcAi + 1] = fp32_to_bf16(gA01 + gA_cA01);
-            grad_A[gcAi + 2] = fp32_to_bf16(gA10 + gA_cA10);
-            grad_A[gcAi + 3] = fp32_to_bf16(gA11 + gA_cA11);
+            for (int s = 0; s < N; s++) {
+                grad_A[gcAi + s] = fp32_to_bf16(gA_state[s] + gA_cA[s]);
+            }
         }
 
-        // Propagate dcA backward: dcA_accum for step t-1 = A[t]^T @ dcA_accum[t]
-        float new_dcA00 = a11 * dcA00 + a21 * dcA10;
-        float new_dcA01 = a11 * dcA01 + a21 * dcA11;
-        float new_dcA10 = a12 * dcA00 + a22 * dcA10;
-        float new_dcA11 = a12 * dcA01 + a22 * dcA11;
-        dcA00 = new_dcA00; dcA01 = new_dcA01;
-        dcA10 = new_dcA10; dcA11 = new_dcA11;
+        // Propagate dcA backward: dcA_accum for step t-1
+        //   dcA_new = conj(A[t]) * dcA (complex multiply)
+        //   conj of stored conj(mu) = mu = (re, -im)
+        //   (re - i*im) * (dcA_re + i*dcA_im)
+        //     = re*dcA_re + im*dcA_im + i*(re*dcA_im - im*dcA_re)
+        //   But stored is (re, im) = conj(mu), so conj(stored) = (re, -im):
+        //     new_dcA_re = re*dcA_re + im*dcA_im
+        //     new_dcA_im = re*dcA_im - im*dcA_re
+        for (int j = 0; j < N / 2; j++) {
+            float re = a[2 * j];
+            float im = a[2 * j + 1];
+            float dc_re = dcA[2 * j];
+            float dc_im = dcA[2 * j + 1];
+            dcA[2 * j]     = re * dc_re + im * dc_im;
+            dcA[2 * j + 1] = re * dc_im - im * dc_re;
+        }
 
-        // 2. Backward through erasure: h_mod = h_prev - beta*(kTh⊗k)
-        // zeta[s] = sum_d(dhm[s,d] * k[d])
-        float zeta_0 = block_reduce_to_scalar(dhm0 * k_d, smem, D);
+        
+        // Backward through erasure: h_mod = h_prev - beta*(kTh outer k)
+        
+
+        // zeta[s] = sum_d(dhm[s,d] * k[d]) — batched reduction
+        float zeta_local[MAX_STATE_DIM];
+        for (int s = 0; s < N; s++) zeta_local[s] = dhm[s] * k_d;
+        for (int s = 0; s < N; s++) zeta_local[s] = warp_reduce_sum(zeta_local[s]);
+        if (lane_id == 0) {
+            for (int s = 0; s < N; s++) smem[warp_id * MAX_STATE_DIM + s] = zeta_local[s];
+        }
         __syncthreads();
-        float zeta_1 = block_reduce_to_scalar(dhm1 * k_d, smem, D);
+        float zeta[MAX_STATE_DIM];
+        for (int s = 0; s < N; s++) {
+            zeta[s] = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < MAX_WARPS; w++) {
+                if (w < num_warps) zeta[s] += smem[w * MAX_STATE_DIM + s];
+            }
+        }
         __syncthreads();
 
         // grad_k from erasure (per-thread):
-        // -beta * (kTh[s]*dhm[s,d] + h_prev[s,d]*zeta[s]) summed over s
-        float gk_erase = -beta * (kTh_0 * dhm0 + hp0 * zeta_0
-                                 + kTh_1 * dhm1 + hp1 * zeta_1);
+        //   -beta * sum_s(kTh[s]*dhm[s,d] + h_prev[s,d]*zeta[s])
+        float gk_erase = 0.0f;
+        for (int s = 0; s < N; s++) {
+            gk_erase += kTh[s] * dhm[s] + hp[s] * zeta[s];
+        }
+        gk_erase *= -beta;
 
-        // grad_beta from erasure: -(kTh[0]*zeta[0] + kTh[1]*zeta[1])
-        float gbeta_erase = -(kTh_0 * zeta_0 + kTh_1 * zeta_1);
+        // grad_beta from erasure: -sum_s(kTh[s]*zeta[s])
+        float gbeta_erase = 0.0f;
+        for (int s = 0; s < N; s++) {
+            gbeta_erase -= kTh[s] * zeta[s];
+        }
 
         // Store grad_K, grad_beta
         grad_K[K_base + t * K_step + d] = fp32_to_bf16(gk_inject + gk_erase);
@@ -403,55 +545,63 @@ __global__ void intra_chunk_scan_bwd_kernel(
         }
 
         // Propagate dh backward to h_prev for next iteration
-        // dh_prev[s,d] = dhm[s,d] - beta * zeta[s] * k[d]
-        dh0 = dhm0 - beta * zeta_0 * k_d;
-        dh1 = dhm1 - beta * zeta_1 * k_d;
+        //   dh_prev[s,d] = dhm[s,d] - beta * zeta[s] * k[d]
+        for (int s = 0; s < N; s++) {
+            dh[s] = dhm[s] - beta * zeta[s] * k_d;
+        }
     }
 }
 
 
+
 // Launch Functions
+
 
 std::tuple<torch::Tensor, torch::Tensor>
 intra_chunk_scan_fwd_cuda(
-    torch::Tensor A_flat,      // (BNC, C, H, 2, 2) BF16
-    torch::Tensor K_flat,      // (BNC, C, H, D)    BF16
-    torch::Tensor V_flat,      // (BNC, C, H, 2)    BF16
-    torch::Tensor beta_flat    // (BNC, C, H)       BF16
+    torch::Tensor A_flat,      // (BNC, C, H, N)  BF16
+    torch::Tensor K_flat,      // (BNC, C, H, D)  BF16
+    torch::Tensor V_flat,      // (BNC, C, H, N)  BF16
+    torch::Tensor beta_flat,   // (BNC, C, H)     BF16
+    int state_dim              // N (runtime)
 ) {
     TORCH_CHECK(A_flat.is_cuda(), "A_flat must be CUDA");
     TORCH_CHECK(K_flat.is_cuda(), "K_flat must be CUDA");
     TORCH_CHECK(V_flat.is_cuda(), "V_flat must be CUDA");
     TORCH_CHECK(beta_flat.is_cuda(), "beta_flat must be CUDA");
 
-    A_flat = A_flat.contiguous();
-    K_flat = K_flat.contiguous();
-    V_flat = V_flat.contiguous();
+    A_flat    = A_flat.contiguous();
+    K_flat    = K_flat.contiguous();
+    V_flat    = V_flat.contiguous();
     beta_flat = beta_flat.contiguous();
 
     const int BNC = A_flat.size(0);
     const int C   = A_flat.size(1);
     const int H   = A_flat.size(2);
     const int D   = K_flat.size(3);
+    const int N   = state_dim;
 
     TORCH_CHECK(D <= MAX_HEAD_DIM, "head_dim must be <= ", MAX_HEAD_DIM);
+    TORCH_CHECK(N <= MAX_STATE_DIM, "state_dim must be <= ", MAX_STATE_DIM);
+    TORCH_CHECK(N % 2 == 0, "state_dim must be even (complex pairs)");
 
     auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(A_flat.device());
-    auto local_h = torch::empty({BNC, C, H, 2, D}, opts);
-    auto cum_A   = torch::empty({BNC, C, H, 2, 2}, opts);
+    auto local_h = torch::empty({BNC, C, H, N, D}, opts);
+    auto cum_A   = torch::empty({BNC, C, H, N}, opts);
 
     dim3 grid(BNC, H);
     dim3 block(D);
+    size_t smem_bytes = MAX_WARPS * MAX_STATE_DIM * sizeof(float);
     cudaStream_t stream = get_cuda_stream();
 
-    intra_chunk_scan_fwd_kernel<<<grid, block, 0, stream>>>(
+    intra_chunk_scan_fwd_kernel<<<grid, block, smem_bytes, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(A_flat.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(K_flat.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(V_flat.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(beta_flat.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(local_h.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(cum_A.data_ptr()),
-        BNC, C, H, D
+        BNC, C, H, D, N
     );
     CUDA_CHECK_LAST();
 
@@ -460,14 +610,15 @@ intra_chunk_scan_fwd_cuda(
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 intra_chunk_scan_bwd_cuda(
-    torch::Tensor grad_local_h,  // (BNC, C, H, 2, D) BF16
-    torch::Tensor grad_cum_A,    // (BNC, C, H, 2, 2) BF16
-    torch::Tensor A_flat,        // (BNC, C, H, 2, 2) BF16
+    torch::Tensor grad_local_h,  // (BNC, C, H, N, D) BF16
+    torch::Tensor grad_cum_A,    // (BNC, C, H, N)    BF16
+    torch::Tensor A_flat,        // (BNC, C, H, N)    BF16
     torch::Tensor K_flat,        // (BNC, C, H, D)    BF16
-    torch::Tensor V_flat,        // (BNC, C, H, 2)    BF16
+    torch::Tensor V_flat,        // (BNC, C, H, N)    BF16
     torch::Tensor beta_flat,     // (BNC, C, H)       BF16
-    torch::Tensor local_h,       // (BNC, C, H, 2, D) BF16
-    torch::Tensor cum_A          // (BNC, C, H, 2, 2) BF16
+    torch::Tensor local_h,       // (BNC, C, H, N, D) BF16
+    torch::Tensor cum_A,         // (BNC, C, H, N)    BF16
+    int state_dim                // N (runtime)
 ) {
     TORCH_CHECK(A_flat.is_cuda(), "A_flat must be CUDA");
 
@@ -484,20 +635,25 @@ intra_chunk_scan_bwd_cuda(
     const int C   = A_flat.size(1);
     const int H   = A_flat.size(2);
     const int D   = K_flat.size(3);
+    const int N   = state_dim;
+
+    TORCH_CHECK(N <= MAX_STATE_DIM, "state_dim must be <= ", MAX_STATE_DIM);
+    TORCH_CHECK(N % 2 == 0, "state_dim must be even (complex pairs)");
 
     auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(A_flat.device());
     auto opts_fp32 = torch::TensorOptions().dtype(torch::kFloat32).device(A_flat.device());
 
-    auto grad_A    = torch::zeros({BNC, C, H, 2, 2}, opts_bf16);
+    auto grad_A    = torch::zeros({BNC, C, H, N}, opts_bf16);
     auto grad_K    = torch::zeros({BNC, C, H, D}, opts_bf16);
-    auto grad_V    = torch::zeros({BNC, C, H, 2}, opts_bf16);
+    auto grad_V    = torch::zeros({BNC, C, H, N}, opts_bf16);
     auto grad_beta = torch::zeros({BNC, C, H}, opts_fp32);
 
     dim3 grid(BNC, H);
     dim3 block(D);
+    size_t smem_bytes = MAX_WARPS * MAX_STATE_DIM * sizeof(float);
     cudaStream_t stream = get_cuda_stream();
 
-    intra_chunk_scan_bwd_kernel<<<grid, block, 0, stream>>>(
+    intra_chunk_scan_bwd_kernel<<<grid, block, smem_bytes, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(grad_local_h.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(grad_cum_A.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(A_flat.data_ptr()),
@@ -510,7 +666,7 @@ intra_chunk_scan_bwd_cuda(
         reinterpret_cast<__nv_bfloat16*>(grad_K.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(grad_V.data_ptr()),
         grad_beta.data_ptr<float>(),
-        BNC, C, H, D
+        BNC, C, H, D, N
     );
     CUDA_CHECK_LAST();
 

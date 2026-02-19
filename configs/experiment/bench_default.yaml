@@ -1,0 +1,14 @@
+experiment_name: bench_default
+
+eval:
+  checkpoint: checkpoints/wikitext_default_best.pt
+  tasks:
+    - wikitext
+    - lambada_openai
+    - hellaswag
+    - piqa
+    - arc_easy
+    - arc_challenge
+    - winogrande
+    - openbookqa
+  output_dir: results/bench_default

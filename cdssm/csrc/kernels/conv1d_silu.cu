@@ -11,15 +11,12 @@
 // - Depthwise conv is a 4-tap FIR filter per channel
 // - Causal padding handled in-kernel
 // - SiLU computed in-place before output write
-//
-// Port of cdssm/kernels/conv1d_silu.py
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
 #include "../include/common.cuh"
-#include "../include/reduction.cuh"
 
 namespace cdssm {
 

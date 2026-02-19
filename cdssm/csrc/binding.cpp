@@ -1,7 +1,6 @@
 // CDSSM CUDA Extension Bindings
 
 #include <torch/extension.h>
-#include <c10/util/Optional.h>
 
 namespace cdssm {
 
@@ -26,7 +25,8 @@ intra_chunk_scan_fwd_cuda(
     torch::Tensor A_flat,
     torch::Tensor K_flat,
     torch::Tensor V_flat,
-    torch::Tensor beta_flat
+    torch::Tensor beta_flat,
+    int state_dim
 );
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -38,64 +38,23 @@ intra_chunk_scan_bwd_cuda(
     torch::Tensor V_flat,
     torch::Tensor beta_flat,
     torch::Tensor local_h,
-    torch::Tensor cum_A
+    torch::Tensor cum_A,
+    int state_dim
 );
 
 // Inter-chunk sequential scan (inter_chunk_scan.cu)
 torch::Tensor inter_chunk_scan_fwd_cuda(
     torch::Tensor total_A,
-    torch::Tensor final_local_h
+    torch::Tensor final_local_h,
+    int state_dim
 );
 
 std::tuple<torch::Tensor, torch::Tensor>
 inter_chunk_scan_bwd_cuda(
     torch::Tensor grad_chunk_states,
     torch::Tensor total_A,
-    torch::Tensor chunk_states
-);
-
-// Fused Cayley discretization + VP scale (cayley_vp.cu)
-std::tuple<torch::Tensor, torch::Tensor>
-cayley_vp_fwd_cuda(
-    torch::Tensor alpha,
-    torch::Tensor omega,
-    torch::Tensor dt,
-    torch::Tensor r_gate,
-    float gating_c
-);
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-cayley_vp_bwd_cuda(
-    torch::Tensor grad_A_bar,
-    torch::Tensor grad_vp_scale,
-    torch::Tensor alpha,
-    torch::Tensor omega,
-    torch::Tensor dt,
-    torch::Tensor r_gate,
-    float gating_c
-);
-
-// Adaptive timestep (adaptive_dt.cu)
-torch::Tensor adaptive_dt_fwd_cuda(
-    torch::Tensor alpha,
-    torch::Tensor omega,
-    torch::Tensor log_dt_scale,
-    float omega_thresh,
-    float delta,
-    float smoothness,
-    float eps
-);
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-adaptive_dt_bwd_cuda(
-    torch::Tensor grad_dt,
-    torch::Tensor alpha,
-    torch::Tensor omega,
-    torch::Tensor log_dt_scale,
-    float omega_thresh,
-    float delta,
-    float smoothness,
-    float eps
+    torch::Tensor chunk_states,
+    int state_dim
 );
 
 // Fused dynamics kernel (dynamics_fused.cu)
@@ -109,7 +68,8 @@ dynamics_fused_fwd_cuda(
     float adt_delta,
     float adt_smoothness,
     float adt_eps,
-    int H
+    int H,
+    int state_dim
 );
 
 std::tuple<torch::Tensor, torch::Tensor>
@@ -126,7 +86,28 @@ dynamics_fused_bwd_cuda(
     float adt_delta,
     float adt_smoothness,
     float adt_eps,
-    int H
+    int H,
+    int state_dim
+);
+
+// Exact correction kernel (exact_correction.cu)
+torch::Tensor exact_correction_fwd_cuda(
+    torch::Tensor A_chunk,
+    torch::Tensor K_chunk,
+    torch::Tensor beta_chunk,
+    torch::Tensor chunk_states,
+    int state_dim
+);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+exact_correction_bwd_cuda(
+    torch::Tensor grad_corrections,
+    torch::Tensor A_chunk,
+    torch::Tensor K_chunk,
+    torch::Tensor beta_chunk,
+    torch::Tensor chunk_states,
+    torch::Tensor corrections,
+    int state_dim
 );
 
 // Fused K/Q normalization (normalize_kq.cu)
@@ -161,47 +142,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // Intra-chunk scan
     m.def("intra_chunk_scan_fwd_cuda", &cdssm::intra_chunk_scan_fwd_cuda,
           "Intra-chunk delta-rule scan forward",
-          py::arg("A_flat"), py::arg("K_flat"), py::arg("V_flat"), py::arg("beta_flat"));
+          py::arg("A_flat"), py::arg("K_flat"), py::arg("V_flat"),
+          py::arg("beta_flat"), py::arg("state_dim"));
 
     m.def("intra_chunk_scan_bwd_cuda", &cdssm::intra_chunk_scan_bwd_cuda,
           "Intra-chunk delta-rule scan backward",
           py::arg("grad_local_h"), py::arg("grad_cum_A"),
           py::arg("A_flat"), py::arg("K_flat"), py::arg("V_flat"), py::arg("beta_flat"),
-          py::arg("local_h"), py::arg("cum_A"));
+          py::arg("local_h"), py::arg("cum_A"), py::arg("state_dim"));
 
     // Inter-chunk scan
     m.def("inter_chunk_scan_fwd_cuda", &cdssm::inter_chunk_scan_fwd_cuda,
           "Inter-chunk sequential scan forward",
-          py::arg("total_A"), py::arg("final_local_h"));
+          py::arg("total_A"), py::arg("final_local_h"), py::arg("state_dim"));
 
     m.def("inter_chunk_scan_bwd_cuda", &cdssm::inter_chunk_scan_bwd_cuda,
           "Inter-chunk sequential scan backward",
-          py::arg("grad_chunk_states"), py::arg("total_A"), py::arg("chunk_states"));
-
-    // Cayley + VP scale
-    m.def("cayley_vp_fwd_cuda", &cdssm::cayley_vp_fwd_cuda,
-          "Fused Cayley discretization + VP scale forward",
-          py::arg("alpha"), py::arg("omega"), py::arg("dt"),
-          py::arg("r_gate"), py::arg("gating_c"));
-
-    m.def("cayley_vp_bwd_cuda", &cdssm::cayley_vp_bwd_cuda,
-          "Fused Cayley discretization + VP scale backward",
-          py::arg("grad_A_bar"), py::arg("grad_vp_scale"),
-          py::arg("alpha"), py::arg("omega"), py::arg("dt"),
-          py::arg("r_gate"), py::arg("gating_c"));
-
-    // Adaptive timestep
-    m.def("adaptive_dt_fwd_cuda", &cdssm::adaptive_dt_fwd_cuda,
-          "Adaptive timestep forward",
-          py::arg("alpha"), py::arg("omega"), py::arg("log_dt_scale"),
-          py::arg("omega_thresh"), py::arg("delta"),
-          py::arg("smoothness"), py::arg("eps"));
-
-    m.def("adaptive_dt_bwd_cuda", &cdssm::adaptive_dt_bwd_cuda,
-          "Adaptive timestep backward",
-          py::arg("grad_dt"), py::arg("alpha"), py::arg("omega"),
-          py::arg("log_dt_scale"), py::arg("omega_thresh"),
-          py::arg("delta"), py::arg("smoothness"), py::arg("eps"));
+          py::arg("grad_chunk_states"), py::arg("total_A"), py::arg("chunk_states"),
+          py::arg("state_dim"));
 
     // Fused dynamics
     m.def("dynamics_fused_fwd_cuda", &cdssm::dynamics_fused_fwd_cuda,
@@ -209,7 +167,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("gate_raw"), py::arg("log_dt_scale"), py::arg("rope_freqs"),
           py::arg("gating_c"), py::arg("omega_thresh"),
           py::arg("adt_delta"), py::arg("adt_smoothness"), py::arg("adt_eps"),
-          py::arg("H"));
+          py::arg("H"), py::arg("state_dim"));
 
     m.def("dynamics_fused_bwd_cuda", &cdssm::dynamics_fused_bwd_cuda,
           "Fused dynamics pipeline backward",
@@ -218,7 +176,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("gate_raw"), py::arg("log_dt_scale"), py::arg("rope_freqs"),
           py::arg("gating_c"), py::arg("omega_thresh"),
           py::arg("adt_delta"), py::arg("adt_smoothness"), py::arg("adt_eps"),
-          py::arg("H"));
+          py::arg("H"), py::arg("state_dim"));
+
+    // Exact correction
+    m.def("exact_correction_fwd_cuda", &cdssm::exact_correction_fwd_cuda,
+          "Fused exact correction forward",
+          py::arg("A_chunk"), py::arg("K_chunk"), py::arg("beta_chunk"),
+          py::arg("chunk_states"), py::arg("state_dim"));
+
+    m.def("exact_correction_bwd_cuda", &cdssm::exact_correction_bwd_cuda,
+          "Fused exact correction backward",
+          py::arg("grad_corrections"), py::arg("A_chunk"), py::arg("K_chunk"),
+          py::arg("beta_chunk"), py::arg("chunk_states"), py::arg("corrections"),
+          py::arg("state_dim"));
 
     // Fused K/Q normalization
     m.def("normalize_kq_fwd_cuda", &cdssm::normalize_kq_fwd_cuda,

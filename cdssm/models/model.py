@@ -3,15 +3,17 @@
 import torch.nn as nn
 from torch import Tensor
 
-from cdssm.config.defaults import CDSSMConfig
+from cdssm.config.model import CDSSMConfig
 from cdssm.models.block import CDSSMBlock
-from cdssm.models.components import compute_variance_preserving_std, RMSNorm
+from cdssm.models.modules import RMSNorm
+from cdssm.models.init import compute_variance_preserving_std
 
 
 class CDSSMLMHeadModel(nn.Module):
     """CDSSM Language Model with tied embedding/LM-head weights.
 
     Embedding -> N x CDSSMBlock -> RMSNorm -> LM head (weight-tied).
+    Passes v_first (value residual) across layers for RWKV-7 style interpolation.
     """
 
     def __init__(self, config: CDSSMConfig):
@@ -42,7 +44,8 @@ class CDSSMLMHeadModel(nn.Module):
             logits: (batch, seq_len, vocab_size) - output logits
         """
         x = self.embedding(input_ids)
+        v_first = None
         for block in self.blocks:
-            x = block(x)
+            x, v_first = block(x, v_first=v_first)
         x = self.final_norm(x)
         return self.lm_head(x)

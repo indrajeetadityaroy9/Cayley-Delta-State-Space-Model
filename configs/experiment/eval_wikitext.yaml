@@ -1,0 +1,11 @@
+experiment_name: eval_wikitext
+
+data:
+  dataset_name: wikitext
+  dataset_config: wikitext-103-raw-v1
+  context_length: 1024
+  batch_size: 8
+
+eval:
+  checkpoint: checkpoints/wikitext_default_best.pt
+  output_dir: results/eval_wikitext

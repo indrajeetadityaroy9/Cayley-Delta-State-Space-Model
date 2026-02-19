@@ -18,10 +18,17 @@ def get_cuda_extensions():
     """Build CUDA extensions."""
     csrc_dir = Path("cdssm") / "csrc"
     kernel_dir = csrc_dir / "kernels"
-    cu_files = list((_PROJECT_ROOT / kernel_dir).glob("*.cu"))
+    cu_files = [
+        "conv1d_silu.cu",
+        "dynamics_fused.cu",
+        "intra_chunk_scan.cu",
+        "inter_chunk_scan.cu",
+        "exact_correction.cu",
+        "normalize_kq.cu",
+    ]
 
     sources = [str(csrc_dir / "binding.cpp")] + [
-        str(csrc_dir / "kernels" / f.name) for f in cu_files
+        str(kernel_dir / f) for f in cu_files
     ]
     include_dirs = [str(_PROJECT_ROOT / csrc_dir / "include"), pybind11.get_include()]
 

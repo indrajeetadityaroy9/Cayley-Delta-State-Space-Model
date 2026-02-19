@@ -2,8 +2,6 @@
 
 An attention-free recurrent language model combining Cayley-discretized dissipative dynamics, delta-rule matrix memory, and chunkwise parallel scan. CD-SSM targets long-context causal language modeling with unconditional numerical stability (A-stability) and linear-time training via State Space Duality
 
-## Method
-
 CD-SSM integrates three mechanisms into a single recurrent block:
 
 **Cayley-stable dissipative dynamics.** Each head maintains a 2D state vector evolving under a continuous rotation-damping system `dz/dt = Az` where `A = [[-alpha, omega], [-omega, -alpha]]` with `alpha >= 0`. The Cayley transform `A_bar = (I - tau*A)^{-1}(I + tau*A)` discretizes this system with a provable guarantee: eigenvalues of `A_bar` lie inside the unit disk for any `alpha >= 0` and any step size `dt`, ensuring unconditional stability across arbitrary sequence lengths. A learned recurrence gate modulates the effective eigenvalue magnitude per head per timestep, following the RG-LRU mechanism.
@@ -16,126 +14,10 @@ Adaptive Timestep
 The timestep `dt` adapts to per-head dynamics: `dt_base = softplus(log_dt_scale) / (alpha + |omega| + eps)`, where the characteristic frequency `alpha + |omega|` normalizes the step size. An input-dependent adjustment `dt = dt_base + softplus(sel_dt)` allows the model to modulate temporal resolution per token. A smooth safety cap prevents instability in the low-frequency regime.
 
 Variance-Preserving Initialization
-Initialization follows T-Fixup depth scaling: projection weights scale as `1/sqrt(2 * n_layers)`, dynamics projections as `1/sqrt(n_layers)`, and depthwise convolution as `1/sqrt(kernel_size)`. Gate biases are set to `log(2)`, the unique value maximizing gradient flow through a product of two sigmoid gates (`d/d_sigma[sigma^2(1-sigma)] = 0` at `sigma = 2/3`).
+Initialization follows T-Fixup depth scaling: projection weights scale as `1/sqrt(2 * n_layers)`, dynamics projections as `1/sqrt(2 * n_layers^2)` (base layer scale × additional dynamics dampening), and depthwise convolution as `1/sqrt(kernel_size)`. Gate biases are set to `log(2)`, the unique value maximizing gradient flow through a product of two sigmoid gates (`d/d_sigma[sigma^2(1-sigma)] = 0` at `sigma = 2/3`).
 
 Layer-Stratified Spectral Initialization
 Each layer is assigned a band of the log-timescale range `[1, context_length]`. Early layers cover short timescales (local patterns), deep layers cover long timescales (document-level coherence). The band fraction `2/(n_layers + 1)` is the unique value giving exactly 50% overlap between adjacent layers. Per-head damping rates and frequencies within each band are initialized via inverse softplus from log-spaced timescales.
-
-## Parameter-Free Configuration
-
-The user specifies four values:
-
-```python
-config = CDSSMConfig(
-    d_model=768,
-    n_layers=12,
-    context_length=1024,
-    vocab_size=50257,
-)
-```
-
-All other constants are derived:
-
-| Constant | Value | Source |
-|----------|-------|--------|
-| `d_inner` | `2 * d_model` | Gate + content parallel pathways |
-| `head_dim` | `64` | H100 Tensor Core tile width |
-| `n_heads` | `d_inner / head_dim` | Structural |
-| `chunk_size` | `head_dim` | SSD algorithm alignment |
-| `conv_kernel_size` | `max(2, head_dim // 16)` | Sub-chunk local receptive field |
-| `ssm_norm_groups` | `32` | GPU warp size |
-| `rope_base` | `context_length` | Longest wavelength = sequence length |
-| `gating_c` | `log(context_length)` | Signal decays to `1/L` over `L` steps |
-| `spectral_band_fraction` | `2 / (n_layers + 1)` | 50% overlap between adjacent layers |
-| Gate biases | `log(2)` | Max gradient of sigmoid product |
-| `eps_norm` | `io_eps^2` | Gradient representability in BF16 |
-| `eps_cayley_det` | `compute_eps` | FP32 machine epsilon (bounded denominator) |
-| `eps_adaptive_dt` | `1.0` | Unit frequency floor |
-
-## CUDA Kernels
-
-All kernels use BF16 I/O with FP32 internal compute. Target: NVIDIA H100 (SM 9.0).
-
-| Kernel | File | Description |
-|--------|------|-------------|
-| `dynamics_fused` | `dynamics_fused.cu` | Fused dynamics pipeline: parses 7 per-head gate scalars, computes softplus/RoPE/adaptive dt/Cayley/recurrence gate/VP scale/beta/sel_C in a single launch. Replaces ~15 elementwise PyTorch ops. |
-| `normalize_kq` | `normalize_kq.cu` | Fused L2 normalization of K and Q vectors using warp-level reduction. |
-| `conv1d_silu` | `conv1d_silu.cu` | Fused depthwise Conv1d + SiLU with causal padding. Eliminates transpose-conv-transpose-activation chain. |
-| `intra_chunk_scan` | `intra_chunk_scan.cu` | Delta-rule scan within chunks. Register-resident `(2 x D)` state per thread column. Per timestep: retrieval, selective erasure, Cayley rotation, injection. Tracks cumulative `A_bar` products. |
-| `inter_chunk_scan` | `inter_chunk_scan.cu` | Sequential state propagation between chunks: `state[k+1] = A[k] @ state[k] + h[k]`. |
-| `cayley_vp` | `cayley_vp.cu` | Standalone Cayley discretization + recurrence gate + VP scale (subsumed by `dynamics_fused` in default path). |
-| `adaptive_dt` | `adaptive_dt.cu` | Standalone adaptive timestep (subsumed by `dynamics_fused` in default path). |
-
-The Cayley transform implementation in `cayley_math.cuh` uses FMA instructions (`__fmaf_rn`) and IEEE-compliant division (`__fdiv_rn`) for numerical precision.
-
-## Installation
-
-Requires: Python 3.10+, PyTorch 2.1+, CUDA 12.0+, NVIDIA H100 GPU.
-
-```bash
-pip install -e .
-```
-
-This compiles the CUDA extension `cdssm._C` targeting SM 9.0.
-
-## Usage
-
-### Training
-
-```bash
-# WikiText-103
-python -m cdssm.train --config configs/default.yaml
-
-# FineWeb-Edu (300M tokens, streaming)
-python -m cdssm.train --config configs/fineweb.yaml
-```
-
-### Evaluation
-
-```bash
-# lm-evaluation-harness zero-shot benchmarks
-python -m cdssm.eval --checkpoint checkpoints/best.pt \
-    --tasks wikitext,lambada_openai,hellaswag,piqa,arc_easy,arc_challenge,winogrande
-```
-
-### Hyperparameter Sweep
-
-```bash
-python -m cdssm.sweep --config configs/default.yaml \
-    --lrs 6e-4 4e-4 --seed 42
-```
-
-### Inference
-
-```python
-from cdssm.inference.predict import load_model_from_checkpoint, generate_greedy
-
-model, tokenizer = load_model_from_checkpoint("checkpoints/best.pt")
-output = generate_greedy(model, tokenizer, "The meaning of", max_new_tokens=50)
-```
-
-## Training Configuration
-
-The optimizer uses two parameter groups with depth-scaled learning rates:
-
-| Group | Parameters | Learning Rate |
-|-------|-----------|---------------|
-| Standard | Projections, embeddings, norms | `base_lr` |
-| SSM dynamics | `gate_proj`, `log_dt_scale` | `base_lr / sqrt(2 * n_layers)` |
-
-Default training hyperparameters (`configs/training/default.yaml`):
-
-```yaml
-batch_size: 4
-grad_accum_steps: 8       # effective batch = 32
-base_lr: 6e-4
-weight_decay: 0.1
-betas: [0.9, 0.95]
-warmup_steps: 500
-precision: bfloat16
-grad_clip: 1.0
-min_lr_ratio: 0.0         # cosine decay to zero
-```
 
 ## References
 

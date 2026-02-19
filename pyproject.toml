@@ -1,20 +1,22 @@
 [build-system]
-requires = ["setuptools", "torch>=2.1.0", "pybind11"]
+requires = ["setuptools>=69.0", "torch>=2.1.0,<2.6.0", "pybind11>=2.11.0,<2.14"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "cdssm"
 version = "0.1.0"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.1.0,<2.6.0",
-    "numpy<2.0",
-    "pybind11>=2.11.0",
+    "numpy>=1.24.0,<2.0",
     "datasets>=2.14.0,<3.0",
-    "transformers>=4.36.0,<5.0",
-    "PyYAML>=6.0",
+    "transformers>=4.36.0,<4.46",
+    "PyYAML>=6.0,<7.0",
     "lm-eval==0.4.2",
 ]
+
+[project.scripts]
+cdssm = "cdssm.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
